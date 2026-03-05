@@ -1,0 +1,48 @@
+#!/bin/sh
+
+read -d '' fmt<<-'EOF'
+group_by(.inode)
+| map(
+	foreach .[] as $file (
+		{};
+		. *= {
+			key: $file.inode | tostring,
+			value: {
+				files: (.value.files) + [$file.fullname],
+				tags: { ($file.tagname): $file.tagvalue }
+			}
+		};
+		{ 
+			key: .key,
+			value: {
+				files: .value.files | unique,
+				tags: .value.tags
+			}
+		}
+	)
+)
+| from_entries
+EOF
+
+db="$1"
+shift
+
+test "${#@}" -eq 0 && {
+	echo "at least one WHERE condition is required"
+	exit 1
+} >&2
+
+cat<<-EOF|
+with inodes(inode) as (
+	select  distinct 
+	        inode
+	  from  tags
+	 where  $@
+)
+select  *
+  from  filetags ft
+	join  inodes i
+	  on  ft.inode = i.inode
+EOF
+sqlite3 -bail -json "$db" | jq "$fmt"
+

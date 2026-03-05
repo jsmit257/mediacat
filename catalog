@@ -1,0 +1,387 @@
+#!/bin/sh
+
+trap 'kill 0' INT TERM PIPE
+
+shopt -s lastpipe
+set -o pipefail
+
+alias info='echo -e "\x1b[1;32minfo\x1b[0m"'
+alias warn='echo -e ".print \x1b[1;33mwarn\x1b[0m"'
+alias err='echo -e ".print \x1b[1;31merror\x1b[0m"'
+alias fatal='echo -e "\x1b[1;37;41mfatal\x1b[0m"'
+alias probetags='ffprobe -v quiet -output_format json -show_entries format_tags'
+
+read -d '' tagjq<<-'EOF'
+.format.tags // {} 
+| del(
+	.major_brand, 
+	.minor_version, 
+	.compatible_brands, 
+	.encoder
+)
+EOF
+
+declare -a tagnames=()
+declare -a pids=()
+
+function createdb() {
+	local db="${1//\//_}.db"
+
+	test -e "$db" && {
+		info "removing existing database file \c"
+		rm -v "$db"
+	} >&2
+
+	echo "insert into paths(name) values('$1');" \
+	| sqlite3 -bail -init ./createdb.sql "$db" >&2 || return 1
+
+	info "created database '$db'" >&2
+
+	echo "$db"
+}
+
+function diffnames() {
+	local -a result=()
+
+	for name in "$@"; do
+		for exists in "${tagnames[@]}"; do
+			test "$name" == "$exists" && continue 2
+		done
+
+		result+=("$name")
+	done
+
+	test "${#result[@]}" -eq 0 && return
+
+	printf "%s\n" "${result[@]}"
+}
+
+function createnames() {
+	for name in "$@"; do
+		# we won't ahve to ignore a value more than once per thread, 
+		# but there's no other way to win the race when we don't 
+		# have semaphores
+		echo "insert or ignore into tagnames(tagname) values('$name');"
+	done
+}
+
+function inserttags() {
+	local inode="$1"
+	shift 
+
+	jq -r 'to_entries[] | "\(.key) \(.value)"' <<<"$@" \
+	| while read name value; do
+		cat - <<-EOF
+		insert into tagvalues(tagvalue, inode, tagnameid)
+		select  '${value//\'/\'\'}'
+					 ,$inode
+					 ,tn.id
+			from  tagnames tn
+		 where  tn.tagname = '$name'
+		;
+		EOF
+	done
+}
+
+function createpaths() {
+	local root="$1"
+	echo "${2#$root/}" | IFS=/ read -a pathparts
+
+	for part in "${pathparts[@]}"; do
+		cat - <<-EOF
+		insert or ignore into paths(name, parentid)
+		select  '$part'
+		       ,id
+		  from  fullpaths
+		 where  fullpath = '$root'
+		returning 'created path', '$root/$part'
+		;
+		EOF
+
+		root="$root/$part"
+	done
+}
+
+function createfile() {
+	local file="$1"
+	local inode="$2"
+
+	cat - <<-EOF
+	insert into files(id, inode)
+	select  fp.id
+	       ,$inode
+	  from  fullpaths fp
+	 where  fp.fullpath = '$file'
+	returning 'created file', '$inode', '$file'
+	;
+	EOF
+}
+
+function create() {
+	local dir="$1"
+	local file="$2"
+	local inode="$3"
+
+	createpaths "$dir" "$file"
+
+	createfile "$file" "$inode"
+}
+
+function closewrite() {
+	local root="$1"
+	local inode="$2"
+	local lastinode="$3"
+	local file="$4"
+
+	if test "$inode" -ne "$lastinode"; then
+		echo "insert into inodes(inode) values($inode);"
+
+		warn "tagnames: [${#tagnames[@]}] [${tagnames[@]}]"
+		if ! probetags "$file" | jq -c "$tagjq" | read tags; then
+			warn "failed to read tags from '$file'"
+			return 1
+		elif test "$tags" == '{}'; then 
+			warn  "no tags found in file '$file'"
+		elif ! echo "$tags" | jq -r 'keys[]' | readarray -t tempnames; then
+			fatal "failed to extract tag names from '$tags'" >&2
+		elif ! diffnames "${tempnames[@]}" | readarray -t newnames; then
+			warn "couldn't difference tag names" # this won't happen
+		elif ! createnames "${newnames[@]}"; then
+			err "couldn't create statements for new tagnames '${newnames[@]}'"
+		elif ! inserttags "$inode" "$tags"; then
+			fatal "couldn't create statements for new tagvalues" >&2
+		else
+			echo ".print `info "added ${#tempnames[@]} tags for '$inode'"`"
+		fi
+
+		tagnames+=("${newnames[@]}")
+	fi
+
+	create "$root" "$file" "$inode"
+}
+
+function initdb() {
+	local root="$1"
+	local db="$2"
+	local lastinode=0
+
+	find "$root" -type f -printf "%i %p\n" \
+	| sort -k 1g \
+	| while read inode file; do
+		closewrite "$root" "$inode" "$lastinode" "$file"
+
+		lastinode="$inode"
+	done \
+	| sqlite3 -bail "$db"
+
+	info "initialized database '$db'"
+} >&2
+
+function remove() {
+	local file="$1"
+	local inode="$2"
+	local linkcount="$3"
+
+	cat - <<-EOF
+	delete  from files
+	 where  id = (
+	  select  fp.id
+	    from  fullpaths fp
+	   where  fp.fullpath = '$file')
+	;
+	delete  from paths
+	 where  id = (
+	  select  fp.id
+	    from  fullpaths fp
+	   where  fp.fullpath = '$file')
+	;
+	.print removed references to '$file'
+	EOF
+
+	test "$linkcount" -eq 0 && cat - <<-EOF
+	delete  from tagvalues
+	 where  inode = '$inode'
+	;
+	delete  from inodes
+	 where  inode = '$inode'
+	;
+	.print removed inode $inode and values for '$file'
+	EOF
+}
+
+function gettransients() {
+	db="$1"
+	cookie="$2"
+
+	cat - <<-EOF|
+	select  oldpath
+	       ,filetype
+	  from  transients
+	 where  cookie = '$cookie'
+	EOF
+	sqlite3 "$db" | IFS='|' read oldid filetype
+
+	echo "$oldid" "$filetype"
+}
+
+function movedto() {
+	db="$1"
+	dir="$2"
+	file="$3"
+	inode="$4"
+	cookie="$5"
+
+	gettransients "$db" "$cookie" | read oldid filetype
+
+	echo ".print `info "dir[$dir] file[$file] inode[$inode] coolie[$cookie] oldid[$oldid] filetype[$filetype]"`"
+	createpaths "$dir" "$file"
+
+	if test "$filetype" == "d" -a -n "$oldid"; then
+		# for simple renaming we could just update the name, but when
+		# the directory has moved around in the tree it gets more 
+		# complicated; unconditional create and update is sorta ham-
+		# fisted, and it leaves an orphan, but the cleanup proc will 
+		# fix it, eventually
+		cat - <<-EOF
+		update  paths
+		   set  parentid = (
+		  select  fp.id
+		    from  fullpaths fp
+		   where  fp.fullpath = '$file')
+		 where  parentid = $oldid
+		 ;
+		EOF
+	elif test -n "$oldid"; then
+		warn "$filetype is NOT dir and oldid is '$oldid'"
+		cat - <<-EOF
+		update  files
+		   set  id = (
+		  select  fp.id
+		    from  fullpaths fp
+		   where  fp.fullpath = '$file')
+		 where  id = $oldid
+		;
+		EOF
+	else
+		warn "$filetype is NOT dir and oldid is empty"
+		# FiXME: this calls createpaths unnecessarily
+		closewrite "$dir" "$inode" 0 "$file"
+	fi
+
+	cat - <<-EOF
+	delete  from transients 
+	 where  cookie = '$cookie'
+	 ;
+	.print `info "finished move_to event for '$file'"`
+	EOF
+}
+
+function cleandb() {
+	cat - <<-EOF
+	delete from transients 
+	 where unixepoch(current_timestamp) - unixepoch(created) > 5
+	returning 'removed transient', *
+	;
+	with deps(parentid) as (
+		select  id as parentid
+		  from  files
+		union
+		select  parentid
+		  from  paths
+	)
+	delete  from paths
+	 where  not exists (
+	   select  1
+	     from  deps d
+	    where  paths.id = d.parentid)
+	returning 'removed path', *
+	;
+	.print `info "swept old records and orphans"`
+	EOF
+}
+
+function listen() {
+	local dir="$1"
+	local db="$2"
+	local inode linkcount filetype events cookie file
+
+	sqlite3 "$db" <<<"select tagname from tagnames" | readarray -t tagnames
+
+	inotifywait -m -r -e create -e close_write -e move -e delete --format "%e %c %w%f" "$dir" \
+	| while read events cookie file; do
+
+		if test -e "$file"; then
+			find "$file" -maxdepth 0 -printf "%i %n %y" | read inode linkcount filetype
+		else
+			linkcount=0
+			cat - <<-EOF|
+			select  inode
+			       ,'f'
+			  from  files       f
+			  join  fullpaths   fp
+			    on  f.id        = fp.id
+			 where  fp.fullpath = '$file'
+			EOF
+			sqlite3 "$db" | IFS='|' read inode filetype
+			if test -z "$inode"; then 
+				filetype='d'
+			fi
+		fi
+
+		events="${events},CLEAN_DB"
+
+		while read event; do
+			case "$event" in
+				CREATE) test "$linkcount" -gt 1 -a ! -d "$file" && create "$dir" "$file" "$inode" ;;
+
+				DELETE) grep -q '.*/$' <<<"$file" || remove "$file" "$inode" "$linkcount" ;;
+
+				CLOSE_WRITE) closewrite "$dir" "$inode" "0" "$file" ;;
+
+				MOVED_FROM) cat - <<-EOF
+				insert into transients(cookie, oldpath, filetype)
+				select  '$cookie'
+				       ,id
+				       ,'$filetype'
+				  from  fullpaths
+				 where  fullpath = '$file'
+				returning 'created transient', *
+				;
+				EOF
+				;;
+
+				MOVED_TO) movedto "$db" "$dir" "$file" "$inode" "$cookie" ;;
+
+				CLEAN_DB) cleandb ;;
+			esac
+
+		done <<<"${events//,/$'\n'}" \
+		| sqlite3 -echo -bail "$db" >&2
+
+	done
+}
+
+for dir in "$@"; do 
+	readlink -f "$dir" | read dir
+
+	test -d "$dir" || {
+		fatal "'$dir' does not specify a directory"
+		exit 1
+	}
+
+	if ! createdb "$dir" | read db; then
+		fatal "failed to create database"
+		exit 1
+	elif ! initdb "$dir" "$db"; then
+		fatal "failed to initialize database"
+		exit 1
+	fi
+
+	listen "$dir" "$db" &
+	pids+=($!)
+done
+
+info "successfully started process $$"
+
+wait "${pids[@]}"
+
