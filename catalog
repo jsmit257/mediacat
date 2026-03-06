@@ -12,11 +12,11 @@ alias fatal='echo -e "\x1b[1;37;41mfatal\x1b[0m"'
 alias probetags='ffprobe -v quiet -output_format json -show_entries format_tags'
 
 read -d '' tagjq<<-'EOF'
-.format.tags // {} 
+.format.tags // {}
 | del(
-	.major_brand, 
-	.minor_version, 
-	.compatible_brands, 
+	.major_brand,
+	.minor_version,
+	.compatible_brands,
 	.encoder
 )
 EOF
@@ -58,8 +58,8 @@ function diffnames() {
 
 function createnames() {
 	for name in "$@"; do
-		# we won't ahve to ignore a value more than once per thread, 
-		# but there's no other way to win the race when we don't 
+		# we won't have to ignore a value more than once per thread,
+		# but there's no other way to win the race when we don't
 		# have semaphores
 		echo "insert or ignore into tagnames(tagname) values('$name');"
 	done
@@ -67,12 +67,16 @@ function createnames() {
 
 function inserttags() {
 	local inode="$1"
-	shift 
+	shift
 
 	jq -r 'to_entries[] | "\(.key) \(.value)"' <<<"$@" \
 	| while read name value; do
+		# there's a rare case when we move a tree from outside the root and
+		# it contains inodes that are already under the root using other names,
+		# but we bave no good way to know that (w/o constantly hitting the db) so
+		# we ignore the unique key violation (the value will be the same, anyway)
 		cat - <<-EOF
-		insert into tagvalues(tagvalue, inode, tagnameid)
+		insert  or ignore into tagvalues(tagvalue, inode, tagnameid)
 		select  '${value//\'/\'\'}'
 					 ,$inode
 					 ,tn.id
@@ -136,14 +140,13 @@ function closewrite() {
 	if test "$inode" -ne "$lastinode"; then
 		echo "insert into inodes(inode) values($inode);"
 
-		warn "tagnames: [${#tagnames[@]}] [${tagnames[@]}]"
 		if ! probetags "$file" | jq -c "$tagjq" | read tags; then
 			warn "failed to read tags from '$file'"
 			return 1
-		elif test "$tags" == '{}'; then 
+		elif test "$tags" == '{}'; then
 			warn  "no tags found in file '$file'"
 		elif ! echo "$tags" | jq -r 'keys[]' | readarray -t tempnames; then
-			fatal "failed to extract tag names from '$tags'" >&2
+			fatal "failed to extract tag names from '$tags' for '$file'" >&2
 		elif ! diffnames "${tempnames[@]}" | readarray -t newnames; then
 			warn "couldn't difference tag names" # this won't happen
 		elif ! createnames "${newnames[@]}"; then
@@ -162,7 +165,6 @@ function closewrite() {
 
 function initdb() {
 	local root="$1"
-	local db="$2"
 	local lastinode=0
 
 	find "$root" -type f -printf "%i %p\n" \
@@ -171,11 +173,10 @@ function initdb() {
 		closewrite "$root" "$inode" "$lastinode" "$file"
 
 		lastinode="$inode"
-	done \
-	| sqlite3 -bail "$db"
+	done
 
-	info "initialized database '$db'"
-} >&2
+	echo ".print `info "initialized database"`"
+}
 
 function remove() {
 	local file="$1"
@@ -198,7 +199,7 @@ function remove() {
 	.print removed references to '$file'
 	EOF
 
-	test "$linkcount" -eq 0 && cat - <<-EOF
+	test "$linkcount" -lt 2 && cat - <<-EOF
 	delete  from tagvalues
 	 where  inode = '$inode'
 	;
@@ -209,39 +210,17 @@ function remove() {
 	EOF
 }
 
-function gettransients() {
-	db="$1"
-	cookie="$2"
+function moveddirto() {
+	file="$1"
+	oldid="$2"
 
-	cat - <<-EOF|
-	select  oldpath
-	       ,filetype
-	  from  transients
-	 where  cookie = '$cookie'
-	EOF
-	sqlite3 "$db" | IFS='|' read oldid filetype
-
-	echo "$oldid" "$filetype"
-}
-
-function movedto() {
-	db="$1"
-	dir="$2"
-	file="$3"
-	inode="$4"
-	cookie="$5"
-
-	gettransients "$db" "$cookie" | read oldid filetype
-
-	echo ".print `info "dir[$dir] file[$file] inode[$inode] coolie[$cookie] oldid[$oldid] filetype[$filetype]"`"
-	createpaths "$dir" "$file"
-
-	if test "$filetype" == "d" -a -n "$oldid"; then
+	if test -n "$oldid"; then
+		warn "filetype is dir and oldid is '$oldid'"
 		# for simple renaming we could just update the name, but when
-		# the directory has moved around in the tree it gets more 
+		# the directory has moved around in the tree it gets more
 		# complicated; unconditional create and update is sorta ham-
-		# fisted, and it leaves an orphan, but the cleanup proc will 
-		# fix it, eventually
+		# fisted, and it leaves an orphan, but the cleanup proc will
+		# fix it
 		cat - <<-EOF
 		update  paths
 		   set  parentid = (
@@ -249,10 +228,25 @@ function movedto() {
 		    from  fullpaths fp
 		   where  fp.fullpath = '$file')
 		 where  parentid = $oldid
-		 ;
+		;
 		EOF
-	elif test -n "$oldid"; then
-		warn "$filetype is NOT dir and oldid is '$oldid'"
+	else
+		warn "directory was moved into this tree from elsewhere"
+		# if dir was moved/copied from somewhere else on the same filesystem, 
+		# then this does effectively nothing, but the file close_write events
+		# will do the job one at a time
+		initdb "$file"
+	fi
+}
+
+function movedfileto() {
+	dir="$1"
+	file="$2"
+	inode="$3"
+	oldid="$4"
+
+	if test -n "$oldid"; then
+		warn "filetype is NOT dir and oldid is '$oldid'"
 		cat - <<-EOF
 		update  files
 		   set  id = (
@@ -263,37 +257,61 @@ function movedto() {
 		;
 		EOF
 	else
-		warn "$filetype is NOT dir and oldid is empty"
-		# FiXME: this calls createpaths unnecessarily
+		warn "file was moved into this tree from elsewhere"
+		# FIXME: this calls createpaths unnecessarily
 		closewrite "$dir" "$inode" 0 "$file"
+	fi
+}
+
+function movedto() {
+	dir="$1"
+	file="$2"
+	inode="$3"
+
+	cat - | IFS='|' read oldid filetype
+
+	createpaths "$dir" "$file"
+
+	if test "$filetype" == "d"; then
+		moveddirto "$file" "$oldid"
+	else
+		movedfileto "$dir" "$file" "$inode" "$oldid"
 	fi
 
 	cat - <<-EOF
-	delete  from transients 
+	delete  from transients
 	 where  cookie = '$cookie'
-	 ;
+	;
 	.print `info "finished move_to event for '$file'"`
 	EOF
 }
 
 function cleandb() {
+	db="$1"
+
+	date +"%s" | read now
+
+	cat - <<-EOF|
+	select  file
+	       ,inode
+	       ,linkcount
+	  from  pruned
+	 where  $now - unixepoch(created) > 5
+	EOF
+	sqlite3 -bail "$db" \
+	| while IFS='|' read file inode linkcount; do
+		remove "$file" "$inode" "$linkcount"
+	done
+
 	cat - <<-EOF
-	delete from transients 
-	 where unixepoch(current_timestamp) - unixepoch(created) > 5
-	returning 'removed transient', *
+	delete  from transients
+	 where  $now - unixepoch(created) > 5
 	;
-	with deps(parentid) as (
-		select  id as parentid
-		  from  files
-		union
-		select  parentid
-		  from  paths
-	)
 	delete  from paths
-	 where  not exists (
+	 where  exists (
 	   select  1
-	     from  deps d
-	    where  paths.id = d.parentid)
+	     from  orphans o
+	    where  o.id = paths.id)
 	returning 'removed path', *
 	;
 	.print `info "swept old records and orphans"`
@@ -305,36 +323,40 @@ function listen() {
 	local db="$2"
 	local inode linkcount filetype events cookie file
 
-	sqlite3 "$db" <<<"select tagname from tagnames" | readarray -t tagnames
+	#sqlite3 "$db" <<<"select tagname from tagnames" | readarray -t tagnames
 
 	inotifywait -m -r -e create -e close_write -e move -e delete --format "%e %c %w%f" "$dir" \
 	| while read events cookie file; do
-
+		[[ "$events" == *ISDIR* ]] && filetype=d || filetype=f
+		
 		if test -e "$file"; then
-			find "$file" -maxdepth 0 -printf "%i %n %y" | read inode linkcount filetype
+			find "$file" -maxdepth 0 -printf "%i %n" | read inode linkcount
 		else
-			linkcount=0
 			cat - <<-EOF|
-			select  inode
-			       ,'f'
+			select  f.inode
+			       ,count(links.id)
 			  from  files       f
 			  join  fullpaths   fp
 			    on  f.id        = fp.id
+			  join  files       links
+			    on  f.inode = links.inode
 			 where  fp.fullpath = '$file'
+			 group
+			    by  f.inode
 			EOF
-			sqlite3 "$db" | IFS='|' read inode filetype
-			if test -z "$inode"; then 
-				filetype='d'
-			fi
+			sqlite3 "$db" | IFS='|' read inode linkcount
 		fi
 
-		events="${events},CLEAN_DB"
+		events="${events/,ISDIR},CLEAN_DB"
 
 		while read event; do
 			case "$event" in
-				CREATE) test "$linkcount" -gt 1 -a ! -d "$file" && create "$dir" "$file" "$inode" ;;
+				# FIXME: the linkcount test is intended to ignore net-new files b/c they won't
+				# have tags until close_write, with the unintended side-effect that fules linked
+				# from outside the root won't have their tags indexed
+				CREATE) test "$linkcount" -gt 1 -a "$filetype" == f && create "$dir" "$file" "$inode" ;;
 
-				DELETE) grep -q '.*/$' <<<"$file" || remove "$file" "$inode" "$linkcount" ;;
+				DELETE) test "$filetype" == d || remove "$file" "$inode" "$linkcount" ;;
 
 				CLOSE_WRITE) closewrite "$dir" "$inode" "0" "$file" ;;
 
@@ -350,18 +372,23 @@ function listen() {
 				EOF
 				;;
 
-				MOVED_TO) movedto "$db" "$dir" "$file" "$inode" "$cookie" ;;
+				MOVED_TO) cat - <<-EOF|
+				select  oldpath
+				       ,filetype
+				  from  transients
+				 where  cookie = '$cookie'
+				EOF
+				sqlite3 "$db" | movedto "$dir" "$file" "$inode"
+				;;
 
-				CLEAN_DB) cleandb ;;
-			esac
-
-		done <<<"${events//,/$'\n'}" \
-		| sqlite3 -echo -bail "$db" >&2
+				CLEAN_DB) cleandb "$db" ;;
+			esac | sqlite3 -bail "$db" >&2
+		done <<<"${events//,/$'\n'}"
 
 	done
 }
 
-for dir in "$@"; do 
+for dir in "$@"; do
 	readlink -f "$dir" | read dir
 
 	test -d "$dir" || {
@@ -372,7 +399,7 @@ for dir in "$@"; do
 	if ! createdb "$dir" | read db; then
 		fatal "failed to create database"
 		exit 1
-	elif ! initdb "$dir" "$db"; then
+	elif ! initdb "$dir" | sqlite3 -bail "$db"; then
 		fatal "failed to initialize database"
 		exit 1
 	fi
