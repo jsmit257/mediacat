@@ -1,0 +1,295 @@
+#!/bin/sh
+
+shopt -s lastpipe
+
+cd "`dirname "$0"`"
+
+mkdir ./sample 2>/dev/null
+
+readlink -f ./sample | read watched
+
+db="${watched//\//_}.db" # FIXME: should come from catalog
+
+alias debug='echo -e "\x1b[1;36mdebug\x1b[0m"'
+alias start='echo -e "\n\x1b[1;33mstarting\x1b[0m"'
+alias pass='echo -e "\x1b[1;35mpassed\x1b[0m"'
+alias fail='echo -e "\x1b[1;31mfailed\x1b[0m"'
+
+alias query='sqlite3 -bail -readonly -json "../$db"'
+alias findmedia='../findmedia "$watched"'
+
+export NO_CAT_DAEMON=1
+jqcompare='if ($expected | sort) != . then error("unexpected results") else "pass" end'
+jqnotcontains='if contains($exclude) then error("path(s) not removed") else "pass" end'
+
+# create sample video with metadata tags from a 1x1px image file
+function vidgen() {
+	dst="$1.mp4"
+	shift
+
+	args=("$@")
+	for i in `seq 0 2 "${#args[@]}"`; do
+		args[i+1]="${args[i]}=${args[i+1]/\'/\'\'}"
+		args[i]=-metadata
+	done
+
+	ffmpeg \
+		-nostdin \
+		-hide_banner \
+		-nostats \
+		-v error \
+		-i px.gif \
+		-loop 1 \
+		-c:v hevc \
+		-x265-params log-level=error \
+		-pix_fmt yuv420p \
+		-s 50:50 \
+		"${args[@]}" \
+		"pool/$dst"
+}
+
+# ensure all the directories and sample files exist
+function sanity() {
+	start "setting up the test environment"
+	rm -fr "$watched"/* ./pool/*
+
+	mkdir -vp pool "$watched"/{foo/{bar,quux},one/two/three} &&
+	vidgen agaric title "Do NOT Eat" artist "Fly Agaric" &&
+	vidgen liberty artist "Ben Franklin" description "The OG" &&
+	vidgen morel description "Good Luck Finding Them" comment "Gourmet" &&
+	vidgen muertos comment "Like it's 1999" date "1999.12.31" &&
+	vidgen phosphor date "1970.01.01" title "Unix Epoch" &&
+	ln -v pool/{agaric,morel,phosphor}.mp4 "$watched" && {
+		pass "setting up the test environment"
+	} || {
+		return 1
+	}
+}
+
+function allpathnames() {
+	echo "select * from paths" \
+	| query \
+	| jq '[.[].name] | sort' \
+	| tee >(cat >&2)
+}
+
+function inodepaths() {
+	echo "select * from inodepaths" \
+	| query \
+	| jq '[.[].inodepath] | sort' \
+	| tee >(cat >&2)
+}
+
+function findmediafiles() {
+	findmedia "$@" | jq '.[].files' | tee >(cat >&2)
+}
+
+function rebuild() {
+	read -d '' inodepaths<<-EOF
+	[
+	  "$watched/agaric.mp4",
+	  "$watched/phosphor.mp4",
+	  "$watched/morel.mp4"
+	]
+	EOF
+
+	start "rebuild, expected inodepaths: $inodepaths"
+
+	../catalog -rebuild "$watched" || {
+		fail "executing rebuild"
+		return 1
+	}
+
+	inodepaths | jq --argjson expected "$inodepaths" -r "$jqcompare" || return 1
+
+	pass "rebuild"
+}
+
+function link_one_from_pool() {
+	read -d '' inodepaths<<-EOF
+	[
+	  "$watched/agaric.mp4",
+	  "$watched/phosphor.mp4",
+	  "$watched/foo/bar/liberty.mp4",
+	  "$watched/morel.mp4"
+	]
+	EOF
+
+	start "link_one_from_pool, expected inodepaths: $inodepaths"
+
+	ln -v "pool/liberty.mp4" "$watched/foo/bar"
+
+	../catalog -sync "$watched" || {
+		fail "executing link_one_from_pool"
+		return 1
+	}
+
+	inodepaths | jq --argjson expected "$inodepaths" -r "$jqcompare" || return 1
+
+	pass "link_one_from_pool"
+}
+
+function remove_file_in_tree() {
+	read -d '' inodepaths<<-EOF
+	[
+	  "$watched/agaric.mp4",
+	  "$watched/phosphor.mp4",
+	  "$watched/foo/bar/liberty.mp4"
+	]
+	EOF
+
+	start "remove_file_in_tree, expected inodepaths: $inodepaths"
+
+	rm -v "$watched/morel.mp4"
+
+	../catalog -sync "$watched" || {
+		fail "executing remove_file_in_tree"
+		return 1
+	}
+
+	inodepaths | jq --argjson expected "$inodepaths" -r "$jqcompare" || return 1
+
+	pass "remove_file_in_tree"
+}
+
+function move_file_in_tree() {
+	read -d '' inodepaths<<-EOF
+	[
+	  "$watched/agaric.mp4",
+	  "$watched/phosphor.mp4",
+	  "$watched/foo/quux/liberty.mp4"
+	]
+	EOF
+
+	start "move_file_in_tree, expected inodepaths: $inodepaths"
+
+	mv -v "$watched/foo/bar/liberty.mp4" "$watched/foo/quux"
+
+	../catalog -sync "$watched" || {
+		fail "executing move_file_in_tree"
+		return 1
+	}
+
+	inodepaths | jq --argjson expected "$inodepaths" -r "$jqcompare" || return 1
+
+	pass "move_file_in_tree"
+}
+
+function non_unique_link() {
+	read -d '' inodepaths<<-EOF
+	[
+	  "$watched/agaric.mp4",
+	  "$watched/phosphor.mp4",
+	  "$watched/foo/quux/liberty.mp4",
+	  "$watched/one/two/three/liberty.mp4"
+	]
+	EOF
+	read -d '' mediafiles<<-EOF
+	[
+	  "$watched/foo/quux/liberty.mp4",
+	  "$watched/one/two/three/liberty.mp4"
+	]
+	EOF
+
+	start "non_unique_link, expected inodepaths: $inodepaths and mediafiles: $mediafiles"
+
+	ln -v "pool/liberty.mp4" "$watched/one/two/three"
+
+	../catalog -sync "$watched" || {
+		fail "executing non_unique_link"
+		return 1
+	}
+
+	inodepaths | jq --argjson expected "$inodepaths" -r "$jqcompare" || return 1
+
+	findmediafiles	"tagvalue = 'Ben Franklin'" \
+	| jq --argjson expected "$mediafiles" -r "$jqcompare" || return 1
+
+	pass "non_unique_link"
+}
+
+function cleanup_orphaned_trees() {
+	read -d '' excludepaths<<-EOF
+	[
+	  "foo",
+	  "bar",
+	  "quux"
+	]
+	EOF
+
+	start "cleanup_orphaned_trees, should not contain paths: $excludepaths"
+
+	rm -v "$watched/foo/quux/liberty.mp4"
+
+	../catalog -sync "$watched" || {
+		fail "executing move_file_in_tree"
+		return 1
+	}
+
+	allpathnames | jq --argjson exclude "$excludepaths" -r "$jqnotcontains" || return 1
+
+	pass "cleanup_orphaned_trees"
+}
+
+function fake_moved_from() {
+	# removinb 'two' removes dependents 'three' and 'liberry,mp4' and
+	# also leaves 'one' a leafless orphan, so it get's removed too;
+	# note that the fule is still there - this is a *fake* move event
+	read -d '' excludepaths<<-EOF
+	[
+		"one",
+	  "two",
+	  "three",
+	  "liberty.mp4"
+	]
+	EOF
+
+	start "fake_moved_from, should not contain paths: $excludepaths"
+
+	cat <<-EOF|
+	insert  into transients(cookie, oldpath, created)
+	select  'cookie'
+	       ,id
+	       ,datetime(current_timestamp, '-1 minute')
+	  from  paths
+	 where  name = 'two'
+	returning 'created transient', *
+	EOF
+	sqlite3 -bail -json "../$db" || {
+		fail "seeding data form fake_moved_from"
+		return 1
+	}
+
+	../catalog -sync "$watched" || {
+		fail "fake_moved_from"
+		return 1
+	}
+
+	allpathnames | jq --argjson exclude "$excludepaths" -r "$jqnotcontains" || return 1
+
+	pass "fake_moved_from"
+}
+
+start "full test suite,,,"
+
+if ! sanity; then
+	fail  "setting up the test environment"
+elif ! rebuild; then
+	fail "rebuild"
+elif ! link_one_from_pool; then
+	fail "link_one_from_pool"
+elif ! remove_file_in_tree; then
+	fail "remove_file_in_tree"
+elif ! move_file_in_tree; then
+	fail "move_file_in_tree"
+elif ! non_unique_link; then
+	fail "non_unique_link"
+elif ! cleanup_orphaned_trees; then
+	fail "cleanup_orphaned_trees"
+elif ! fake_moved_from; then
+	fail "fake_moved_from"
+else
+	echo
+	pass "... full test suite"
+fi
+

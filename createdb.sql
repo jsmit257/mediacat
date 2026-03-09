@@ -1,3 +1,5 @@
+.print [1;32mcreating schema[0m
+
 PRAGMA foreign_keys = ON;
 
 create table inodes (
@@ -32,13 +34,22 @@ create table tagvalues (
 create index fk_tagvalues_inode on tagvalues(inode);
 create index fk_tagvalues_tagnameid on tagvalues(tagnameid);
 
+create table sync (
+	id       integer not null primary key,
+	inode    integer not null,
+	pathname varchar not null,
+	unique (inode, pathname)
+);
+
 create table transients (
 	cookie   varchar  not null primary key,
 	oldpath  integer  not null references paths(id),
-	filetype char(1)  not null,
 	created  datetime not null default current_timestamp
 );
--- transients is too small (usually empty) to need a foreign key index
+--
+-- `.lint` complains, but transients is too small (usually empty) to
+-- need a foreign key index
+--
 
 --
 -- build trees using every path as a tree root
@@ -78,6 +89,54 @@ select  end as id
        ,depth
   from  allpaths
  where  start = 1
+;
+
+--
+-- fullpaths that end in files, include inode in output
+--
+create view inodepaths
+as
+select  f.id
+       ,inode
+       ,fullpath as inodepath
+  from  fullpaths fp
+  join  files     f
+    on  fp.id     = f.id
+;
+
+create view unsynced
+as
+select  s.inode
+       ,s.pathname
+       ,count(links.id) as tagged
+  from  sync       s
+  left
+  join  inodepaths i
+    on  s.pathname = i.inodepath
+  left
+  join  files      links
+    on  s.inode    = links.inode
+ where  i.inode    is null
+ group
+    by  s.inode
+       ,s.pathname
+;
+
+create view removed
+as
+select  ip.inode
+       ,ip.inodepath
+       ,count(links.id) as linkcount
+  from  inodepaths   ip
+  join  files        links
+    on  ip.inode     = links.inode
+  left
+  join  sync         s
+    on  ip.inodepath = s.pathname
+ where  s.id         is null
+ group
+    by  ip.inode
+       ,ip.inodepath
 ;
 
 create view tags
@@ -150,4 +209,6 @@ select  fp.fullpath as file
        ,f.inode
        ,t.created
 ;
+
+.print [1;32mcreated schema[0m
 

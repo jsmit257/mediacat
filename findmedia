@@ -1,5 +1,7 @@
 #!/bin/sh
 
+shopt -s lastpipe
+
 read -d '' fmt<<-'EOF'
 group_by(.inode)
 | map(
@@ -12,7 +14,7 @@ group_by(.inode)
 				tags: { ($file.tagname): $file.tagvalue }
 			}
 		};
-		{ 
+		{
 			key: .key,
 			value: {
 				files: .value.files | unique,
@@ -24,7 +26,18 @@ group_by(.inode)
 | from_entries
 EOF
 
-db="$1"
+readlink -f "$1" | read dir
+test -n "$dir" || {
+	echo "'$1' is not a valid directory"
+	exit 1
+} >&2
+
+db="`dirname "$0"`/${dir//\//_}.db"
+test -f "$db" || {
+	echo "'$dir' is not a watched directory"
+	exit 1
+} >&2
+
 shift
 
 test "${#@}" -eq 0 && {
@@ -34,15 +47,15 @@ test "${#@}" -eq 0 && {
 
 cat<<-EOF|
 with inodes(inode) as (
-	select  distinct 
+	select  distinct
 	        inode
 	  from  tags
 	 where  $@
 )
 select  *
   from  filetags ft
-	join  inodes i
-	  on  ft.inode = i.inode
+  join  inodes i
+    on  ft.inode = i.inode
 EOF
-sqlite3 -bail -json "$db" | jq "$fmt"
+sqlite3 -readonly -bail -json "$db" | jq "$fmt"
 

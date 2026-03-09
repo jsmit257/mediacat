@@ -11,6 +11,10 @@ alias err='echo -e ".print \x1b[1;31merror\x1b[0m"'
 alias fatal='echo -e "\x1b[1;37;41mfatal\x1b[0m"'
 alias probetags='ffprobe -v quiet -output_format json -show_entries format_tags'
 
+dirname "$0" | read homedir
+
+declare -a pids
+
 read -d '' tagjq<<-'EOF'
 .format.tags // {}
 | del(
@@ -21,27 +25,9 @@ read -d '' tagjq<<-'EOF'
 )
 EOF
 
-declare -a tagnames=()
-declare -a pids=()
-
-function createdb() {
-	local db="${1//\//_}.db"
-
-	test -e "$db" && {
-		info "removing existing database file \c"
-		rm -v "$db"
-	} >&2
-
-	echo "insert into paths(name) values('$1');" \
-	| sqlite3 -bail -init ./createdb.sql "$db" >&2 || return 1
-
-	info "created database '$db'" >&2
-
-	echo "$db"
-}
-
 function diffnames() {
 	local -a result=()
+	local name exists
 
 	for name in "$@"; do
 		for exists in "${tagnames[@]}"; do
@@ -57,6 +43,8 @@ function diffnames() {
 }
 
 function createnames() {
+	local name
+
 	for name in "$@"; do
 		# we won't have to ignore a value more than once per thread,
 		# but there's no other way to win the race when we don't
@@ -67,20 +55,17 @@ function createnames() {
 
 function inserttags() {
 	local inode="$1"
+	local name value
 	shift
 
 	jq -r 'to_entries[] | "\(.key) \(.value)"' <<<"$@" \
 	| while read name value; do
-		# there's a rare case when we move a tree from outside the root and
-		# it contains inodes that are already under the root using other names,
-		# but we bave no good way to know that (w/o constantly hitting the db) so
-		# we ignore the unique key violation (the value will be the same, anyway)
 		cat - <<-EOF
-		insert  or ignore into tagvalues(tagvalue, inode, tagnameid)
+		insert  into tagvalues(tagvalue, inode, tagnameid)
 		select  '${value//\'/\'\'}'
-					 ,$inode
-					 ,tn.id
-			from  tagnames tn
+		       ,$inode
+		       ,tn.id
+		  from  tagnames tn
 		 where  tn.tagname = '$name'
 		;
 		EOF
@@ -89,6 +74,8 @@ function inserttags() {
 
 function createpaths() {
 	local root="$1"
+	local pathparts part
+
 	echo "${2#$root/}" | IFS=/ read -a pathparts
 
 	for part in "${pathparts[@]}"; do
@@ -98,7 +85,6 @@ function createpaths() {
 		       ,id
 		  from  fullpaths
 		 where  fullpath = '$root'
-		returning 'created path', '$root/$part'
 		;
 		EOF
 
@@ -121,23 +107,15 @@ function createfile() {
 	EOF
 }
 
-function create() {
-	local dir="$1"
-	local file="$2"
-	local inode="$3"
-
-	createpaths "$dir" "$file"
-
-	createfile "$file" "$inode"
-}
-
 function closewrite() {
 	local root="$1"
 	local inode="$2"
-	local lastinode="$3"
-	local file="$4"
+	local file="$3"
+	local tags tempnames newnames
 
-	if test "$inode" -ne "$lastinode"; then
+	read lastinode
+
+	if test "$inode" -ne "${lastinode:-0}"; then
 		echo "insert into inodes(inode) values($inode);"
 
 		if ! probetags "$file" | jq -c "$tagjq" | read tags; then
@@ -160,28 +138,49 @@ function closewrite() {
 		tagnames+=("${newnames[@]}")
 	fi
 
-	create "$root" "$file" "$inode"
+	createpaths "$root" "$file"
+
+	createfile "$file" "$inode"
 }
 
 function initdb() {
 	local root="$1"
 	local lastinode=0
+	local inode file
 
 	find "$root" -type f -printf "%i %p\n" \
 	| sort -k 1g \
 	| while read inode file; do
-		closewrite "$root" "$inode" "$lastinode" "$file"
+		closewrite "$root" "$inode" "$file" <<<"$lastinode"
 
 		lastinode="$inode"
 	done
 
-	echo ".print `info "initialized database"`"
+	echo ".print `info "finished processing tree '$root'"`"
+}
+
+function createdb() {
+	local dir="$1"
+	local db="$2"
+
+	test -e "$db" && {
+		info "removing existing database file \c"
+		rm -v "$db"
+	} >&2
+
+	cat "$homedir/createdb.sql"
+
+	echo "insert into paths(name) values('$dir');"
+
+	initdb "$dir"
 }
 
 function remove() {
 	local file="$1"
 	local inode="$2"
-	local linkcount="$3"
+	local linkcount
+
+	read linkcount
 
 	cat - <<-EOF
 	delete  from files
@@ -211,31 +210,37 @@ function remove() {
 }
 
 function moveddirto() {
-	file="$1"
+	dir="$1"
 	oldid="$2"
 
 	if test -n "$oldid"; then
-		warn "filetype is dir and oldid is '$oldid'"
-		# for simple renaming we could just update the name, but when
-		# the directory has moved around in the tree it gets more
-		# complicated; unconditional create and update is sorta ham-
-		# fisted, and it leaves an orphan, but the cleanup proc will
-		# fix it
+		# for simple renaming we could just update the name in paths,
+		# but when the directory has moved around in the tree it gets
+		# more complicated; unconditional create and update is sorta
+		# ham-fisted, and it leaves an orphan, but the cleanup proc
+		# will fix it
 		cat - <<-EOF
 		update  paths
 		   set  parentid = (
 		  select  fp.id
 		    from  fullpaths fp
-		   where  fp.fullpath = '$file')
+		   where  fp.fullpath = '$dir')
 		 where  parentid = $oldid
 		;
 		EOF
 	else
-		warn "directory was moved into this tree from elsewhere"
-		# if dir was moved/copied from somewhere else on the same filesystem, 
-		# then this does effectively nothing, but the file close_write events
-		# will do the job one at a time
-		initdb "$file"
+		# an amalgam of initdb and movefileto that indexes new files,
+		# but checks each inode one at a time, instead of relying on
+		# the sorted order of the list for finding duplicate inodes
+		#  when moving on the same filesystem; when copying or moving
+		# from a different filesystem, this is a no-op, but close_write
+		# will pick up new files one at a time
+		find "$dir" -type f -printf "%i %p\n" \
+		| while read inode file; do
+			echo "select inode from inodes where inode = $inode" \
+			| sqlite3 -readonly "$db" \
+			| closewrite "$dir" "$inode" "$file"
+		done
 	fi
 }
 
@@ -246,7 +251,6 @@ function movedfileto() {
 	oldid="$4"
 
 	if test -n "$oldid"; then
-		warn "filetype is NOT dir and oldid is '$oldid'"
 		cat - <<-EOF
 		update  files
 		   set  id = (
@@ -257,20 +261,22 @@ function movedfileto() {
 		;
 		EOF
 	else
-		warn "file was moved into this tree from elsewhere"
-		# FIXME: this calls createpaths unnecessarily
-		closewrite "$dir" "$inode" 0 "$file"
+		echo "select inode from inodes where inode = $inode" \
+		| sqlite3 -readonly "$db" \
+		| closewrite "$dir" "$inode" "$file"
 	fi
 }
 
 function movedto() {
-	dir="$1"
-	file="$2"
-	inode="$3"
+	local dir="$1"
+	local file="$2"
+	local inode="$3"
+	local filetype="$4"
+	local oldid
 
-	cat - | IFS='|' read oldid filetype
+	read oldid
 
-	createpaths "$dir" "$file"
+	test -n "$oldid" && createpaths "$dir" "$file"
 
 	if test "$filetype" == "d"; then
 		moveddirto "$file" "$oldid"
@@ -288,6 +294,9 @@ function movedto() {
 
 function cleandb() {
 	db="$1"
+	local now file inode linkcount
+
+	echo ".print `info "starting cleanup"`"
 
 	date +"%s" | read now
 
@@ -298,14 +307,15 @@ function cleandb() {
 	  from  pruned
 	 where  $now - unixepoch(created) > 5
 	EOF
-	sqlite3 -bail "$db" \
+	sqlite3 -readonly "$db" \
 	| while IFS='|' read file inode linkcount; do
-		remove "$file" "$inode" "$linkcount"
+		remove "$file" "$inode" <<<"$linkcount"
 	done
 
 	cat - <<-EOF
 	delete  from transients
 	 where  $now - unixepoch(created) > 5
+	returning 'removed aged transient', *
 	;
 	delete  from paths
 	 where  exists (
@@ -318,53 +328,83 @@ function cleandb() {
 	EOF
 }
 
+function syncdb() {
+	local root="$1"
+	local db="$2"
+	local inode file lastinode=0 currlinks=0
+
+	find "$root" -type f -printf "%i %p\n" \
+	| while read inode file; do
+		echo "insert into sync(inode, pathname) values($inode, '$file');";
+	done | sqlite3 -bail "$db" || return 1
+
+	echo "select inode, inodepath, linkcount from removed order by inode" \
+	| sqlite3 -readonly "$db" \
+	| while IFS='|' read inode file linkcount; do
+		test "$inode" -ne "$lastinode" && currlinks="$linkcount" || let currlinks--
+		remove "$file" "$inode" <<<"$currlinks"
+		lastinode="$inode"
+	done | sqlite3 -bail "$dbbase.db" || return 1
+
+	lastinode=0
+	echo "select inode, pathname, tagged from unsynced order by inode" \
+	| sqlite3 -readonly "$db" \
+	| while IFS='|' read inode file tagged; do
+		test "$tagged" -gt 0 && lastinode="$inode"
+		closewrite "$root" "$inode" "$file" <<<"$lastinode"
+		lastinode="$inode"
+	done | sqlite3 -bail "$dbbase.db" || return 1
+
+	cleandb "$db" | sqlite3 -bail "$dbbase.db" || return 1
+
+	cat - <<-EOF|
+	delete from sync;
+	vacuum;
+	.print `info "finished sync '$db' on dir '$root'"`
+	EOF
+	sqlite3 -bail "$dbbase.db" || return 1
+}
+
 function listen() {
 	local dir="$1"
 	local db="$2"
-	local inode linkcount filetype events cookie file
+	local events cookie file inode filetype
 
-	#sqlite3 "$db" <<<"select tagname from tagnames" | readarray -t tagnames
+	echo "select tagname from tagnames" | sqlite3 -readonly "$db" | readarray -t tagnames
 
 	inotifywait -m -r -e create -e close_write -e move -e delete --format "%e %c %w%f" "$dir" \
 	| while read events cookie file; do
 		[[ "$events" == *ISDIR* ]] && filetype=d || filetype=f
 		
-		if test -e "$file"; then
-			find "$file" -maxdepth 0 -printf "%i %n" | read inode linkcount
-		else
-			cat - <<-EOF|
-			select  f.inode
-			       ,count(links.id)
-			  from  files       f
-			  join  fullpaths   fp
-			    on  f.id        = fp.id
-			  join  files       links
-			    on  f.inode = links.inode
-			 where  fp.fullpath = '$file'
-			 group
-			    by  f.inode
-			EOF
-			sqlite3 "$db" | IFS='|' read inode linkcount
-		fi
+		if ! stat --printf "%i" "$file" 2>/dev/null; then
+			# this happens on DELETE and MOVED_FROM; directories don't care
+			# about inodes (or subsequent linkcounts)
+			echo "select inode from inodepaths where inodepath = '$file'" \
+			| sqlite3 -readonly "$db"
+		fi | read inode
 
-		events="${events/,ISDIR},CLEAN_DB"
+		events="CLEAN_DB,${events/,ISDIR}"
 
 		while read event; do
 			case "$event" in
-				# FIXME: the linkcount test is intended to ignore net-new files b/c they won't
-				# have tags until close_write, with the unintended side-effect that fules linked
-				# from outside the root won't have their tags indexed
-				CREATE) test "$linkcount" -gt 1 -a "$filetype" == f && create "$dir" "$file" "$inode" ;;
+				CREATE) test "$filetype" == f -a "`stat --printf "%h" "$file"`" != "1" &&
+				echo "select inode from inodes where inode = $inode" \
+				| sqlite3 -readonly "$db" \
+				| closewrite "$dir" "$inode" "$file"
+				;;
 
-				DELETE) test "$filetype" == d || remove "$file" "$inode" "$linkcount" ;;
+				DELETE) test "$filetype" == d ||
+				echo "select count(1) from files where inode = $inode" \
+				| sqlite3 -readonly "$db" \
+				| remove "$file" "$inode"
+				;;
 
-				CLOSE_WRITE) closewrite "$dir" "$inode" "0" "$file" ;;
+				CLOSE_WRITE) closewrite "$dir" "$inode" "$file" <<<0 ;;
 
 				MOVED_FROM) cat - <<-EOF
-				insert into transients(cookie, oldpath, filetype)
+				insert into transients(cookie, oldpath)
 				select  '$cookie'
 				       ,id
-				       ,'$filetype'
 				  from  fullpaths
 				 where  fullpath = '$file'
 				returning 'created transient', *
@@ -374,41 +414,68 @@ function listen() {
 
 				MOVED_TO) cat - <<-EOF|
 				select  oldpath
-				       ,filetype
 				  from  transients
 				 where  cookie = '$cookie'
 				EOF
-				sqlite3 "$db" | movedto "$dir" "$file" "$inode"
+				sqlite3 -readonly "$db" | movedto "$dir" "$file" "$inode" "$filetype"
 				;;
 
 				CLEAN_DB) cleandb "$db" ;;
-			esac | sqlite3 -bail "$db" >&2
+			esac | sqlite3 -echo -bail "$db" >&2
 		done <<<"${events//,/$'\n'}"
-
 	done
-}
+} >&2
 
-for dir in "$@"; do
-	readlink -f "$dir" | read dir
+for arg in "$@"; do
+	if test "$arg" == "-rebuild"; then
+		test -n "$SYNC_CAT" && {
+			echo "only one of -rebuild or -sync allowed for a directory"
+			exit 1
+		}
+		BUILD_CAT=1
+		continue
+	elif test "$arg" == "-sync"; then
+		test -n "$BUILD_CAT" && {
+			echo "only one of -rebuild or -sync allowed for a directory"
+			exit 1
+		}
+		SYNC_CAT=1
+		continue
+	fi
+
+	readlink -f "$arg" | read dir
 
 	test -d "$dir" || {
 		fatal "'$dir' does not specify a directory"
 		exit 1
 	}
 
-	if ! createdb "$dir" | read db; then
+	dbbase="$homedir/${dir//\//_}"
+
+	test -f "$dbbase.db" || BUILD_CAT=1
+
+	case 1 in
+	"$BUILD_CAT") createdb "$dir" "$dbbase.db" | sqlite3 -bail "$dbbase.db" || {
 		fatal "failed to create database"
 		exit 1
-	elif ! initdb "$dir" | sqlite3 -bail "$db"; then
-		fatal "failed to initialize database"
+	}
+	;;
+	"$SYNC_CAT") syncdb "$dir" "$dbbase.db" || {
+		fatal "failed to sync database"
 		exit 1
+	}
+	;;
+	esac
+
+	if test -z "$NO_CAT_DAEMON"; then
+		(listen "$dir" "$dbbase.db" 2>&1 | tee "$dbbase.log") &
+		pids+=("$!")
 	fi
 
-	listen "$dir" "$db" &
-	pids+=($!)
-done
+	unset BUILD_CAT SYNC_CAT
+done >&2
 
-info "successfully started process $$"
+info "successfully started process $$ with '${#pids[@]}' pid(s): '${pids[@]}'" >&2
 
 wait "${pids[@]}"
 
