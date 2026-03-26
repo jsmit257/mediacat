@@ -1,6 +1,8 @@
 *
 ! .gitignore
-! catalog
-! createdb.sql
-! findmedia
+! ./bin/catalog
+! ./bin/findmedia
+! ./bin/logrotate
+! ./etc/createdb.sql
+! ./tests/unit
 

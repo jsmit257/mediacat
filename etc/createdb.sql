@@ -1,4 +1,4 @@
-.print [1;32mcreating schema[0m
+.print "\033[1;32mcreating schema\033[0m"
 
 PRAGMA foreign_keys = ON;
 
@@ -133,6 +133,7 @@ select  ip.inode
   left
   join  sync         s
     on  ip.inodepath = s.pathname
+   and  ip.inode     = s.inode
  where  s.id         is null
  group
     by  ip.inode
@@ -154,12 +155,10 @@ as
 select  t.inode
        ,t.tagname
        ,t.tagvalue
-       ,fp.fullpath as fullname
-  from  tags      t
-  join  files     f
-    on  t.inode   = f.inode
-  join  fullpaths fp
-    on  f.id      = fp.id
+       ,ip.inodepath as fullname
+  from  tags       t
+  join  inodepaths ip
+    on  t.inode    = ip.inode
 ;
 
 create view orphans
@@ -210,5 +209,5 @@ select  fp.fullpath as file
        ,t.created
 ;
 
-.print [1;32mcreated schema[0m
+.print "\033[1;32mcreated schema\033[0m"
 

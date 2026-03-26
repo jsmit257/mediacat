@@ -32,7 +32,9 @@ test -n "$dir" || {
 	exit 1
 } >&2
 
-db="`dirname "$0"`/${dir//\//_}.db"
+readlink -f "`dirname "$0"`/.." | read homedir
+
+db="${homedir}/data/$dir/data.db"
 test -f "$db" || {
 	echo "'$dir' is not a watched directory"
 	exit 1

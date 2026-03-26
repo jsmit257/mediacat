@@ -1,0 +1,37 @@
+#!/bin/sh
+
+MAX_LOGS=5
+MAX_LOG_SIZE="$[1<<20]"
+
+test -d "$1" || {
+	echo "'$1' is not a directory"
+	exit 1
+} >&2
+
+watchdir="$1"
+
+function rotate() {
+	log="$1"
+
+	test "`du -b "$log" | cut -f1`" -lt "$MAX_LOG_SIZE" && return
+
+	for i in `seq "$MAX_LOGS" -1 2`; do
+		test -f "$log.$[i-1]" && cat "$log.$[i-1]" >"$log.$i"
+	done
+
+	cat "$log" >"$log.1"
+
+	truncate -s 0 "$log"
+}
+
+function log() {
+	while read -d $'\n' line; do
+		echo "`date --iso-8601=seconds` $line"
+	done
+}
+
+inotifywait -m -e close_write --format "%f" "$watchdir" \
+| while read file; do
+	[[ "$file" == *.log.[0-9]* ]] || rotate "$watchdir/$file"
+done
+

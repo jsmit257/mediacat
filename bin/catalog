@@ -1,19 +1,19 @@
 #!/bin/sh
 
-trap 'kill 0' INT TERM PIPE
-
 shopt -s lastpipe
 set -o pipefail
 
 alias info='echo -e "\x1b[1;32minfo\x1b[0m"'
-alias warn='echo -e ".print \x1b[1;33mwarn\x1b[0m"'
-alias err='echo -e ".print \x1b[1;31merror\x1b[0m"'
+alias warn='echo -e "\x1b[1;33mwarn\x1b[0m"'
+alias err='echo -e "\x1b[1;31merror\x1b[0m"'
 alias fatal='echo -e "\x1b[1;37;41mfatal\x1b[0m"'
+alias sqlinfo='echo -e ".print \x1b[1;32minfo\x1b[0m"'
+alias sqlwarn='echo -e ".print \x1b[1;33mwarn\x1b[0m"'
+alias sqlerr='echo -e ".print \x1b[1;31merror\x1b[0m"'
+alias sqlfatal='echo -e ".print \x1b[1;37;41mfatal\x1b[0m"'
 alias probetags='ffprobe -v quiet -output_format json -show_entries format_tags'
 
-dirname "$0" | read homedir
-
-declare -a pids
+readlink -f "`dirname "$0"`/.." | read homedir
 
 read -d '' tagjq<<-'EOF'
 .format.tags // {}
@@ -24,6 +24,47 @@ read -d '' tagjq<<-'EOF'
 	.encoder
 )
 EOF
+
+function childids() {
+	local ppid="$1" pid
+
+	ps -o pid= --ppid "$ppid" | while read pid; do
+		echo "$pid"
+		childids "$pid"
+	done
+}
+
+function cleanup() {
+	trap - TERM
+
+	childids "$$" | readarray -t children
+	fatal "cleanup id: '$$' chidlids: '${children[@]}'"
+
+	CAT_FORCED=1 ckrunning "$1"
+}
+
+function ckrunning() {
+	local rundir="${homedir}/var/run$1"
+	local pid pgid
+
+	test -d "$rundir" || return 1
+
+	find "$rundir" -maxdepth 1 -type f -empty -printf "%f" | read pid
+	test -z "$pid" && return 1
+
+	if ! ps -o pgid= -p "$pid" | read pgid; then
+		fatal "process '$pid' is not running"
+		rm "$rundir/$pid"
+		return 1
+	elif test -z "$CAT_FORCED"; then
+		fatal "a process [$pid] is already listening on '$1'" >&3
+		return
+	fi
+
+	rm "$rundir/$pid"
+
+	kill -TERM -"$pgid" && return 1 || return 0
+}
 
 function diffnames() {
 	local -a result=()
@@ -73,12 +114,13 @@ function inserttags() {
 }
 
 function createpaths() {
-	local root="$1"
+	local root="${1//\'/\'\'}"
 	local pathparts part
 
 	echo "${2#$root/}" | IFS=/ read -a pathparts
 
 	for part in "${pathparts[@]}"; do
+		part="${part//\'/\'\'}"
 		cat - <<-EOF
 		insert or ignore into paths(name, parentid)
 		select  '$part'
@@ -93,7 +135,7 @@ function createpaths() {
 }
 
 function createfile() {
-	local file="$1"
+	local file="${1//\'/\'\'}"
 	local inode="$2"
 
 	cat - <<-EOF
@@ -111,28 +153,31 @@ function closewrite() {
 	local root="$1"
 	local inode="$2"
 	local file="$3"
-	local tags tempnames newnames
+	local tags tempnames newnames lastinode
 
 	read lastinode
 
 	if test "$inode" -ne "${lastinode:-0}"; then
+		# poor-man's test for a media file; don't create inode if this fails
+		if ! probetags "$file" | jq -c "$tagjq" | read tags; then
+			sqlwarn "failed to read tags from '$file'"
+			return 1
+		fi
+
 		echo "insert into inodes(inode) values($inode);"
 
-		if ! probetags "$file" | jq -c "$tagjq" | read tags; then
-			warn "failed to read tags from '$file'"
-			return 1
-		elif test "$tags" == '{}'; then
-			warn  "no tags found in file '$file'"
+		if test "$tags" == '{}'; then
+			sqlwarn  "no tags found in file '$file'"
 		elif ! echo "$tags" | jq -r 'keys[]' | readarray -t tempnames; then
-			fatal "failed to extract tag names from '$tags' for '$file'" >&2
+			fatal "failed to extract tag names from '$tags' for '$file'" >&3
 		elif ! diffnames "${tempnames[@]}" | readarray -t newnames; then
-			warn "couldn't difference tag names" # this won't happen
+			sqlwarn "couldn't difference tag names" # this won't happen
 		elif ! createnames "${newnames[@]}"; then
-			err "couldn't create statements for new tagnames '${newnames[@]}'"
+			sqlerr "couldn't create statements for new tagnames '${newnames[@]}'"
 		elif ! inserttags "$inode" "$tags"; then
-			fatal "couldn't create statements for new tagvalues" >&2
+			fatal "couldn't create statements for new tagvalues" >&3
 		else
-			echo ".print `info "added ${#tempnames[@]} tags for '$inode'"`"
+			sqlinfo "added ${#tempnames[@]} tags for '$inode'"
 		fi
 
 		tagnames+=("${newnames[@]}")
@@ -140,23 +185,9 @@ function closewrite() {
 
 	createpaths "$root" "$file"
 
+	# XXX: this fails referential integrity on some unlikely scenario where
+	#      there are multiple links to a non-media file
 	createfile "$file" "$inode"
-}
-
-function initdb() {
-	local root="$1"
-	local lastinode=0
-	local inode file
-
-	find "$root" -type f -printf "%i %p\n" \
-	| sort -k 1g \
-	| while read inode file; do
-		closewrite "$root" "$inode" "$file" <<<"$lastinode"
-
-		lastinode="$inode"
-	done
-
-	echo ".print `info "finished processing tree '$root'"`"
 }
 
 function createdb() {
@@ -168,11 +199,12 @@ function createdb() {
 		rm -v "$db"
 	} >&2
 
-	cat "$homedir/createdb.sql"
+	cat "${homedir}/etc/createdb.sql" - <<-EOF|
+	insert into paths(name) values('$dir');
+	EOF
+	sqlite3 -bail "$db" || return 1
 
-	echo "insert into paths(name) values('$dir');"
-
-	initdb "$dir"
+	syncdb "$dir" "$db"
 }
 
 function remove() {
@@ -198,14 +230,14 @@ function remove() {
 	.print removed references to '$file'
 	EOF
 
-	test "$linkcount" -lt 2 && cat - <<-EOF
+	test "${linkcount:-0}" -lt 2 && cat - <<-EOF
 	delete  from tagvalues
 	 where  inode = '$inode'
 	;
 	delete  from inodes
 	 where  inode = '$inode'
 	;
-	.print removed inode $inode and values for '$file'
+	`sqlinfo "removed inode $inode and values for '$file'"`
 	EOF
 }
 
@@ -229,7 +261,7 @@ function moveddirto() {
 		;
 		EOF
 	else
-		# an amalgam of initdb and movefileto that indexes new files,
+		# an amalgam of syncdb and movefileto that indexes new files,
 		# but checks each inode one at a time, instead of relying on
 		# the sorted order of the list for finding duplicate inodes
 		#  when moving on the same filesystem; when copying or moving
@@ -288,7 +320,7 @@ function movedto() {
 	delete  from transients
 	 where  cookie = '$cookie'
 	;
-	.print `info "finished move_to event for '$file'"`
+	`sqlinfo "finished move_to event for '$file'"`
 	EOF
 }
 
@@ -324,7 +356,7 @@ function cleandb() {
 	    where  o.id = paths.id)
 	returning 'removed path', *
 	;
-	.print `info "swept old records and orphans"`
+	`sqlinfo "swept old records and orphans"`
 	EOF
 }
 
@@ -333,42 +365,67 @@ function syncdb() {
 	local db="$2"
 	local inode file lastinode=0 currlinks=0
 
-	find "$root" -type f -printf "%i %p\n" \
-	| while read inode file; do
-		echo "insert into sync(inode, pathname) values($inode, '$file');";
-	done | sqlite3 -bail "$db" || return 1
+	{
+		echo "begin transaction;"
 
-	echo "select inode, inodepath, linkcount from removed order by inode" \
-	| sqlite3 -readonly "$db" \
-	| while IFS='|' read inode file linkcount; do
-		test "$inode" -ne "$lastinode" && currlinks="$linkcount" || let currlinks--
-		remove "$file" "$inode" <<<"$currlinks"
-		lastinode="$inode"
-	done | sqlite3 -bail "$dbbase.db" || return 1
+		find "$root" -type f -printf "%i %p\n" \
+		| while read inode file; do
+			echo "insert into sync(inode, pathname) values($inode, '$file');";
+		done
+
+		echo "commit;"
+	} | sqlite3 -bail "$db" || return 1
+
+	{
+		echo "begin transaction;"
+
+		echo "select inode, inodepath, linkcount from removed order by inode" \
+		| sqlite3 -readonly "$db" \
+		| while IFS='|' read inode file linkcount; do
+			test "$inode" -ne "$lastinode" && currlinks="$linkcount" || let currlinks--
+			remove "$file" "$inode" <<<"$currlinks"
+			lastinode="$inode"
+		done
+
+		echo "commit;"
+	} | sqlite3 -bail "$db" || return 1
 
 	lastinode=0
-	echo "select inode, pathname, tagged from unsynced order by inode" \
-	| sqlite3 -readonly "$db" \
-	| while IFS='|' read inode file tagged; do
-		test "$tagged" -gt 0 && lastinode="$inode"
-		closewrite "$root" "$inode" "$file" <<<"$lastinode"
-		lastinode="$inode"
-	done | sqlite3 -bail "$dbbase.db" || return 1
+	{
+		echo "begin transaction;"
 
-	cleandb "$db" | sqlite3 -bail "$dbbase.db" || return 1
+		echo "select inode, pathname, tagged from unsynced order by inode" \
+		| sqlite3 -readonly "$db" \
+		| while IFS='|' read inode file tagged; do
+			test "$tagged" -gt 0 && lastinode="$inode"
+			closewrite "$root" "$inode" "$file" <<<"$lastinode"
+			lastinode="$inode"
+		done
+
+		echo "commit;"
+	} | sqlite3 -bail "$db" || return 1
+
+	cleandb "$db" | sqlite3 -bail "$db" || return 1
 
 	cat - <<-EOF|
 	delete from sync;
 	vacuum;
-	.print `info "finished sync '$db' on dir '$root'"`
+	`sqlinfo "finished sync '$db' on dir '$root'"`
 	EOF
-	sqlite3 -bail "$dbbase.db" || return 1
+	sqlite3 -bail "$db" || return 1
 }
 
 function listen() {
 	local dir="$1"
 	local db="$2"
+	local logdir="$3"
 	local events cookie file inode filetype
+
+	trap 'cleanup "$dir"' INT TERM PIPE
+
+	exec 1>>"$logdir/listen.log" 2>&1
+
+	. "`dirname "$0"`/logrotate" "$logdir" &
 
 	echo "select tagname from tagnames" | sqlite3 -readonly "$db" | readarray -t tagnames
 
@@ -421,61 +478,83 @@ function listen() {
 				;;
 
 				CLEAN_DB) cleandb "$db" ;;
-			esac | sqlite3 -echo -bail "$db" >&2
+			esac | sqlite3 -bail "$db" >&2
 		done <<<"${events//,/$'\n'}"
 	done
 } >&2
 
 for arg in "$@"; do
-	if test "$arg" == "-rebuild"; then
-		test -n "$SYNC_CAT" && {
-			echo "only one of -rebuild or -sync allowed for a directory"
-			exit 1
-		}
-		BUILD_CAT=1
-		continue
-	elif test "$arg" == "-sync"; then
-		test -n "$BUILD_CAT" && {
-			echo "only one of -rebuild or -sync allowed for a directory"
-			exit 1
-		}
-		SYNC_CAT=1
-		continue
-	fi
+	case "$arg" in
+	"-nolisten") CAT_NO_LISTEN=1; continue ;;
+
+	"-force") CAT_FORCED=1; continue ;;
+
+	"-halt") CAT_NO_LISTEN=1 CAT_FORCED=1 ;;&
+
+	-*) test -n "$CAT_COMMAND" && {
+		fatal "only one of -rebuild, -sync or -halt is allowed per directory"
+		fatal "command is already set to '$CAT_COMMAND'"
+		exit 1
+	}
+	CAT_COMMAND="${arg#-}"
+	continue ;;
+	esac
 
 	readlink -f "$arg" | read dir
 
 	test -d "$dir" || {
-		fatal "'$dir' does not specify a directory"
+		fatal "'$dir' from '$arg'  does not specify a directory"
 		exit 1
 	}
 
-	dbbase="$homedir/${dir//\//_}"
-
-	test -f "$dbbase.db" || BUILD_CAT=1
-
-	case 1 in
-	"$BUILD_CAT") createdb "$dir" "$dbbase.db" | sqlite3 -bail "$dbbase.db" || {
-		fatal "failed to create database"
+	logdir="${homedir}/log$dir"
+	test -d "$logdir" || mkdir -vp "$logdir" || {
+		fatal "'$logdir' is not a directory and couldn't be created"
 		exit 1
 	}
-	;;
-	"$SYNC_CAT") syncdb "$dir" "$dbbase.db" || {
-		fatal "failed to sync database"
+	exec 3> >(tee "$logdir/fatal.log")
+
+	dbdir="${homedir}/data$dir"
+	test -d "$dbdir" || mkdir -vp "$dbdir" || {
+		fatal "'$dbdir' is not a directory and couldn't be created" >&3
 		exit 1
 	}
-	;;
-	esac
+	dbname="$dbdir/data.db"
 
-	if test -z "$NO_CAT_DAEMON"; then
-		(listen "$dir" "$dbbase.db" 2>&1 | tee "$dbbase.log") &
-		pids+=("$!")
+	test ! -f "$dbname" -a "$CAT_COMMAND" != 'halt' && CAT_COMMAND=rebuild
+
+	if ckrunning "$dir"; then
+		fatal "failed to execute '${CAT_COMMAND:-listener}'; an instance is still running for '$dir'" >&3
+		exit 1
 	fi
 
-	unset BUILD_CAT SYNC_CAT
+	case "$CAT_COMMAND" in
+	'halt') info "halted listener for '$dir'" ;;
+
+	'rebuild') createdb "$dir" "$dbname" || {
+		fatal "failed to create database" >&3
+		exit 1
+	} 2>&1 | tee "$logdir/build.log" ;;
+
+	'sync') syncdb "$dir" "$dbname" || {
+		fatal "failed to sync database" >&3
+		exit 1
+	} 2>&1 | tee "$logdir/sync.log" ;;
+
+	*) test -n "$CAT_COMMAND" && {
+		fatal "unrecognized command '$CAT_COMMAND'" >&3
+		exit 1
+	} ;;
+	esac
+
+	if test -z "$CAT_NO_LISTEN"; then
+		mkdir -vp "${homedir}/var/run$dir"
+		listen "$dir" "$dbname" "$logdir" &
+		touch "${homedir}/var/run$dir/$!"
+	fi
+
+	unset CAT_COMMAND CAT_NO_LISTEN CAT_NO_DAEMON CAT_FORCED
 done >&2
 
-info "successfully started process $$ with '${#pids[@]}' pid(s): '${pids[@]}'" >&2
-
-wait "${pids[@]}"
+info "successfully started process $$"
 

@@ -8,17 +8,17 @@ mkdir ./sample 2>/dev/null
 
 readlink -f ./sample | read watched
 
-db="${watched//\//_}.db" # FIXME: should come from catalog
+db="../data$watched/data.db" # FIXME: should come from catalog
 
 alias debug='echo -e "\x1b[1;36mdebug\x1b[0m"'
-alias start='echo -e "\n\x1b[1;33mstarting\x1b[0m"'
-alias pass='echo -e "\x1b[1;35mpassed\x1b[0m"'
+alias start='echo -e "\n\x1b[1;33mstarting\x1b[0m ${FUNCNAME[0]}"'
+alias pass='echo -e "\x1b[1;35mpassed\x1b[0m ${FUNCNAME[0]}"'
 alias fail='echo -e "\x1b[1;31mfailed\x1b[0m"'
 
+alias nodaemon='../bin/catalog -nolisten'
 alias query='sqlite3 -bail -readonly -json "../$db"'
 alias findmedia='../findmedia "$watched"'
 
-export NO_CAT_DAEMON=1
 jqcompare='if ($expected | sort) != . then error("unexpected results") else "pass" end'
 jqnotcontains='if contains($exclude) then error("path(s) not removed") else "pass" end'
 
@@ -50,7 +50,7 @@ function vidgen() {
 
 # ensure all the directories and sample files exist
 function sanity() {
-	start "setting up the test environment"
+	start "- setting up the test environment"
 	rm -fr "$watched"/* ./pool/*
 
 	mkdir -vp pool "$watched"/{foo/{bar,quux},one/two/three} &&
@@ -59,11 +59,9 @@ function sanity() {
 	vidgen morel description "Good Luck Finding Them" comment "Gourmet" &&
 	vidgen muertos comment "Like it's 1999" date "1999.12.31" &&
 	vidgen phosphor date "1970.01.01" title "Unix Epoch" &&
-	ln -v pool/{agaric,morel,phosphor}.mp4 "$watched" && {
-		pass "setting up the test environment"
-	} || {
-		return 1
-	}
+	ln -v pool/{agaric,morel,phosphor}.mp4 "$watched" || return 1
+
+	pass "- setting up the test environment"
 }
 
 function allpathnames() {
@@ -93,16 +91,16 @@ function rebuild() {
 	]
 	EOF
 
-	start "rebuild, expected inodepaths: $inodepaths"
+	start "- expected inodepaths: $inodepaths"
 
-	../catalog -rebuild "$watched" || {
+	nodaemon -rebuild "$watched" || {
 		fail "executing rebuild"
 		return 1
 	}
 
 	inodepaths | jq --argjson expected "$inodepaths" -r "$jqcompare" || return 1
 
-	pass "rebuild"
+	pass
 }
 
 function link_one_from_pool() {
@@ -115,18 +113,18 @@ function link_one_from_pool() {
 	]
 	EOF
 
-	start "link_one_from_pool, expected inodepaths: $inodepaths"
+	start "- expected inodepaths: $inodepaths"
 
 	ln -v "pool/liberty.mp4" "$watched/foo/bar"
 
-	../catalog -sync "$watched" || {
+	nodaemon -sync "$watched" || {
 		fail "executing link_one_from_pool"
 		return 1
 	}
 
 	inodepaths | jq --argjson expected "$inodepaths" -r "$jqcompare" || return 1
 
-	pass "link_one_from_pool"
+	pass
 }
 
 function remove_file_in_tree() {
@@ -138,18 +136,18 @@ function remove_file_in_tree() {
 	]
 	EOF
 
-	start "remove_file_in_tree, expected inodepaths: $inodepaths"
+	start "- expected inodepaths: $inodepaths"
 
 	rm -v "$watched/morel.mp4"
 
-	../catalog -sync "$watched" || {
+	nodaemon -sync "$watched" || {
 		fail "executing remove_file_in_tree"
 		return 1
 	}
 
 	inodepaths | jq --argjson expected "$inodepaths" -r "$jqcompare" || return 1
 
-	pass "remove_file_in_tree"
+	pass
 }
 
 function move_file_in_tree() {
@@ -161,18 +159,18 @@ function move_file_in_tree() {
 	]
 	EOF
 
-	start "move_file_in_tree, expected inodepaths: $inodepaths"
+	start "- expected inodepaths: $inodepaths"
 
 	mv -v "$watched/foo/bar/liberty.mp4" "$watched/foo/quux"
 
-	../catalog -sync "$watched" || {
+	nodaemon -sync "$watched" || {
 		fail "executing move_file_in_tree"
 		return 1
 	}
 
 	inodepaths | jq --argjson expected "$inodepaths" -r "$jqcompare" || return 1
 
-	pass "move_file_in_tree"
+	pass
 }
 
 function non_unique_link() {
@@ -191,11 +189,11 @@ function non_unique_link() {
 	]
 	EOF
 
-	start "non_unique_link, expected inodepaths: $inodepaths and mediafiles: $mediafiles"
+	start "- expected inodepaths: $inodepaths and mediafiles: $mediafiles"
 
 	ln -v "pool/liberty.mp4" "$watched/one/two/three"
 
-	../catalog -sync "$watched" || {
+	nodaemon -sync "$watched" || {
 		fail "executing non_unique_link"
 		return 1
 	}
@@ -205,7 +203,7 @@ function non_unique_link() {
 	findmediafiles	"tagvalue = 'Ben Franklin'" \
 	| jq --argjson expected "$mediafiles" -r "$jqcompare" || return 1
 
-	pass "non_unique_link"
+	pass
 }
 
 function cleanup_orphaned_trees() {
@@ -217,18 +215,18 @@ function cleanup_orphaned_trees() {
 	]
 	EOF
 
-	start "cleanup_orphaned_trees, should not contain paths: $excludepaths"
+	start "- should not contain paths: $excludepaths"
 
 	rm -v "$watched/foo/quux/liberty.mp4"
 
-	../catalog -sync "$watched" || {
+	nodaemon -sync "$watched" || {
 		fail "executing move_file_in_tree"
 		return 1
 	}
 
 	allpathnames | jq --argjson exclude "$excludepaths" -r "$jqnotcontains" || return 1
 
-	pass "cleanup_orphaned_trees"
+	pass
 }
 
 function fake_moved_from() {
@@ -237,14 +235,14 @@ function fake_moved_from() {
 	# note that the fule is still there - this is a *fake* move event
 	read -d '' excludepaths<<-EOF
 	[
-		"one",
+	  "one",
 	  "two",
 	  "three",
 	  "liberty.mp4"
 	]
 	EOF
 
-	start "fake_moved_from, should not contain paths: $excludepaths"
+	start "- should not contain paths: $excludepaths"
 
 	cat <<-EOF|
 	insert  into transients(cookie, oldpath, created)
@@ -255,22 +253,22 @@ function fake_moved_from() {
 	 where  name = 'two'
 	returning 'created transient', *
 	EOF
-	sqlite3 -bail -json "../$db" || {
-		fail "seeding data form fake_moved_from"
+	sqlite3 -bail -json "$db" || {
+		fail "seeding data for fake_moved_from"
 		return 1
 	}
 
-	../catalog -sync "$watched" || {
+	nodaemon -sync "$watched" || {
 		fail "fake_moved_from"
 		return 1
 	}
 
 	allpathnames | jq --argjson exclude "$excludepaths" -r "$jqnotcontains" || return 1
 
-	pass "fake_moved_from"
+	pass
 }
 
-start "full test suite,,,"
+start "- full test suite..."
 
 if ! sanity; then
 	fail  "setting up the test environment"
