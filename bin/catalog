@@ -43,7 +43,7 @@
 # MAX_LOG_SIZE log files roll when they exceed this size, in bytes (default 1048576)
 # MAX_LOG_HIST number of rolled log files to keep (deafult 5)
 #
-# see also: findmedia
+# see also: findmedia (https://github.com/jsmit257/mediacat/blob/master/bin/findmedia)
 #
 
 [[ " $* " =~ .*" -help ".* ]] && {
@@ -564,7 +564,7 @@ while test -n "$1"; do
 
 	'-force') CAT_FORCED=1; continue ;;
 
-	'-list') CAT_FORCED=; set -- -nolisten data ;;&
+	'-list') CAT_FORCED=; set -- -nolisten . ;;&
 
 	'-halt') CAT_NO_LISTEN=1 CAT_FORCED=1 ;;&
 

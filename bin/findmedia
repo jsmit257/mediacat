@@ -1,6 +1,76 @@
 #!/bin/sh
+#
+# query a database created by the catalog script (see below) and return results
+# as YAML like the following:
+# 'inode':
+#   files:
+#     - fileName1
+#     ...
+#   tags:
+#     tag: value
+#     ...
+# ...
+#
+# results are objects indexed by inode number, containing a list of files linked
+# to the inode, and a list of metadata tags extracted from then inode
+#
+# usage: findmedia [-help] /watched/directory criterion [and|or] ...
+#
+# -help: print this help and exit, no other processing is performed
+#
+# /watched/directory is the name of a directory that was previously indexed by
+# the catalog script (see below); an error is returned if no database exists
+#
+# criteria is either 'name' or 'value', followed by either '=' (for exact match),
+# or '%' (for a sql `like` pattern match), followed by the value to match; e.g.
+# - name=date: matches all tags named date
+# - value="Tag Value" matches all tags with the exact value 'Tag Value' (i.e.
+#   `where tagvalue = 'Tag Value')
+# - value%"%pattern_" matches all tags that contain zero or more chars ('%'),
+#   followed  by 'pattern' (case-insensitive) followed by exactly one char ('_')
+#   (i.e. `where tagvalue like '%pattern_'`)
+#
+# use 'and' or 'or' between criteria to further refine the search conditions; 'and'
+# is optional and implied when criteria appear consecutively (e.g. name=date
+# value%"2012%" translates to `where tagname = 'date' and tagvalue like '2012%'`);
+# the 'or' conjunction must be specified explicitly
+#
+# it is not recommended to use 'name=tagname' without a corresponding 'value...'
+# criterion as this will likely return a prohibitively long result, but this is
+# not enforced; there is no way to query for `is null` because neither names nor
+# values can ever be null
+#
+# see also: catalog (https://github.com/jsmit257/mediacat/blob/master/bin/catalog)
+#
+
+[[ " $* " =~ .*" -help ".* ]] && {
+	sed -r '2,/^$/ !d; s/^# ?//' "$0"
+	exit
+}
 
 shopt -s lastpipe
+
+function condition() {
+	case "${1:0:1}" in
+	'%') echo "like" ;;
+	'=') echo "=" ;;
+	*)
+		echo "unknown conditional operator '${1[0]}'" >&2
+		exit 1 ;;
+	esac
+}
+
+function parsearg() {
+	local arg="${1//\'/\'\'}"
+
+	case "$arg" in
+	name*) echo "tagname `condition "${arg#name}"` '${arg:5}'" ;;
+	value*) echo "tagvalue `condition "${arg#value}"` '${arg:6}'" ;;
+	*)
+		echo "arguments must start with 'name' or 'value', not '$arg'" >&2
+		exit 1 ;;
+	esac
+}
 
 read -d '' fmt<<-'EOF'
 group_by(.inode)
@@ -27,11 +97,6 @@ group_by(.inode)
 EOF
 
 readlink -f "$1" | read dir
-test -n "$dir" || {
-	echo "'$1' is not a valid directory"
-	exit 1
-} >&2
-
 readlink -f "`dirname "$0"`/.." | read homedir
 
 db="${homedir}/data/$dir/data.db"
@@ -47,17 +112,31 @@ test "${#@}" -eq 0 && {
 	exit 1
 } >&2
 
+parsearg "$1" | read where
+shift
+while test -n "$1"; do
+	case "$1" in
+	'or') where+=" or "; shift ;;
+	'and') shift ;;&
+	*) where+=" and " ;;
+	esac
+
+	where+="`parsearg "$1"`"
+
+	shift
+done
+
 cat<<-EOF|
-with inodes(inode) as (
+with taginodes(inode) as (
 	select  distinct
 	        inode
 	  from  tags
-	 where  $@
+	 where  $where
 )
 select  *
-  from  filetags ft
-  join  inodes i
-    on  ft.inode = i.inode
+  from  filetags  ft
+  join  taginodes ti
+    on  ft.inode  = ti.inode
 EOF
-sqlite3 -readonly -bail -json "$db" | jq "$fmt"
+sqlite3 -readonly -bail -json "$db" | yq -y "$fmt"
 
