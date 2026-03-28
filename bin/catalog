@@ -1,4 +1,55 @@
 #!/bin/sh
+#
+# create databases of tag metadata for directories containing media files
+#
+# usage: catalog [-help] [[-rebuild|-sync|-status|-halt] [-nolisten] [-force] /directory/to/watch] ... [-list]
+#
+# the following commands are mutually exclusive; if no command is specified, and
+# no database exists, one is created and initialized from the watched directory;
+# commands and options only apply to the the directory immediately following them,
+# i.e. to sync two directories, use `-sync dir1 -sync dir2`, not `-sync dir1 dir2`,
+# the latter invocation won't update the database for dir2:
+#
+#    help: print this header and exit; no other commands are processed
+#
+#    rebuild: create a new database or replace existing (no backup) and index the
+#             named directory
+#
+#    sync: diff an existing database with the named directory and remove tag, file
+#          and inode entries for removed files, add entries for new files; if no
+#          database exists, one is created (synonym for `-rebuild`)
+#
+#    status: report the running status of a service for the named directory; it
+#            is not an error if no database exists
+#
+#    halt: stop the service watching the named directory; it is not an error if
+#          the service isn't running
+#
+# these options modify a command's behavior; commands and options can be specified
+# in any order:
+#
+#    nolisten: by default, a background listener process is started to watch the
+#              named directory, this option disables the listener
+#
+#    force: stop any running listener for the named directory  before running a
+#           command and/or starting a listener
+#
+# list: list all service databases and their running status; all arguments
+#       following `-list` are discarded, but commands preceeding `-list` will
+#       still be processed
+#
+# environment variables (used by logrotate):
+#
+# MAX_LOG_SIZE log files roll when they exceed this size, in bytes (default 1048576)
+# MAX_LOG_HIST number of rolled log files to keep (deafult 5)
+#
+# see also: findmedia
+#
+
+[[ " $* " =~ .*" -help ".* ]] && {
+	sed -r '2,/^$/ !d; s/^# ?//' "$0"
+	exit
+}
 
 shopt -s lastpipe
 set -o pipefail
@@ -27,6 +78,16 @@ EOF
 
 . "`dirname "$0"`/logrotate"
 
+function runpid() {
+	find "${homedir}/run$1" -maxdepth 1 -type f -printf "%f" 2>/dev/null | read pid
+
+	if test -n "$pid"; then
+		echo -e "\x1b[1;32mrunning\x1b[1;37m $pid\x1b[0m"
+	else
+		echo -e "\x1b[1;33mnot running\x1b[0m"
+	fi
+}
+
 function childids() {
 	local ppid="$1"
 	local depth="${2:-0}"
@@ -39,12 +100,11 @@ function childids() {
 }
 
 function cleanup() {
-	local rundir="${homedir}/run$1"
 	local pidfile children
 
 	trap - TERM INT PIPE
 
-	find "$rundir" -maxdepth 1 -type f | read pidfile
+	find "${homedir}/run$1" -maxdepth 1 -type f | read pidfile
 
 	cat "$pidfile" | readarray -t children
 
@@ -55,24 +115,25 @@ function cleanup() {
 
 function ckrunning() {
 	local rundir="${homedir}/run$1"
-	local pid
+	local pidfile pid
 
 	test -d "$rundir" || return 1
 
-	find "$rundir" -maxdepth 1 -type f -printf "%f" | read pid
+	find "$rundir" -maxdepth 1 -type f -printf "%p %f" | read pidfile pid
 
 	if test -z "$pid"; then
 		return 1
 	elif ! ps -p "$pid" 1>/dev/null 2>&1; then
 		warn "process '$pid' in '$rundir' is not running"
-		rm "$rundir/$pid"
+		rm "$pidfile"
 		return 1
 	elif test -z "$CAT_FORCED"; then
 		fatal "a process [$pid] is already listening on '$1'" >&3
 		return
 	fi
 
-	childids "$pid" | sort -r -k1 | cut -f2 -d' ' >"$rundir/$pid"
+	childids "$pid" | sort -k1,1r -k2,2 | cut -f2 -d' ' >"$pidfile"
+
 	kill -TERM "$pid" && return 1 || return 0
 }
 
@@ -494,16 +555,23 @@ function listen() {
 	done
 } >&2
 
-for arg in "$@"; do
+while test -n "$1"; do
+	arg="$1"
+	shift
+
 	case "$arg" in
-	"-nolisten") CAT_NO_LISTEN=1; continue ;;
+	'-nolisten') CAT_NO_LISTEN=1; continue ;;
 
-	"-force") CAT_FORCED=1; continue ;;
+	'-force') CAT_FORCED=1; continue ;;
 
-	"-halt") CAT_NO_LISTEN=1 CAT_FORCED=1 ;;&
+	'-list') CAT_FORCED=; set -- -nolisten data ;;&
+
+	'-halt') CAT_NO_LISTEN=1 CAT_FORCED=1 ;;&
+
+	'-status') CAT_NO_LISTEN=1 ;;&
 
 	-*) test -n "$CAT_COMMAND" && {
-		fatal "only one of -rebuild, -sync or -halt is allowed per directory"
+		fatal "only one of -rebuild, -status, -sync or -halt is allowed per directory"
 		fatal "command is already set to '$CAT_COMMAND'"
 		exit 1
 	}
@@ -532,9 +600,9 @@ for arg in "$@"; do
 	}
 	db="$dbdir/data.db"
 
-	test ! -f "$db" -a "$CAT_COMMAND" != 'halt' && CAT_COMMAND=rebuild
+	test ! -f "$db" -a "${CAT_COMMAND:-sync}" == 'sync' && CAT_COMMAND=rebuild
 
-	if ckrunning "$dir"; then
+	if test "$CAT_COMMAND" != 'status' && ckrunning "$dir"; then
 		fatal "failed to execute '${CAT_COMMAND:-listener}'; an instance is still running for '$dir'" >&3
 		exit 1
 	fi
@@ -551,6 +619,14 @@ for arg in "$@"; do
 		fatal "failed to sync database" >&3
 		exit 1
 	} 2>&1 | tee "$logdir/sync.log" ;;
+
+	'status') echo "'$dir' (`runpid "$dir"`)" ;;
+
+	'list') find "${homedir}/data" -name 'data.db' -printf "/%P\n" \
+	| while read svc; do
+		dirname "$svc" | read svc
+		echo -e "- $svc status (`runpid "$svc"`)"
+	done ;;
 
 	*) test -n "$CAT_COMMAND" && {
 		fatal "unrecognized command '$CAT_COMMAND'" >&3
