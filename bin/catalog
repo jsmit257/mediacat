@@ -2,7 +2,7 @@
 #
 # create databases of tag metadata for directories containing media files
 #
-# usage: catalog [-help] [[-rebuild|-sync|-status|-halt] [-nolisten] [-force] /directory/to/watch] ... [-list]
+# usage: catalog [-help] [[-rebuild|-sync|-status|-halt|-remove] [-nolisten] [-force] /directory/to/watch] ... [-list]
 #
 # the following commands are mutually exclusive; if no command is specified, and
 # no database exists, one is created and initialized from the watched directory;
@@ -25,6 +25,9 @@
 #    halt: stop the service watching the named directory; it is not an error if
 #          the service isn't running
 #
+#    remove: remove all the files and directories associated with the named
+#            directory, forcing a stop if necessary
+#
 # these options modify a command's behavior; commands and options can be specified
 # in any order:
 #
@@ -34,9 +37,9 @@
 #    force: stop any running listener for the named directory  before running a
 #           command and/or starting a listener
 #
-# list: list all service databases and their running status; all arguments
-#       following `-list` are discarded, but commands preceeding `-list` will
-#       still be processed
+# the list command lists all service databases and their running status; all
+# arguments following `-list` are discarded, but commands preceeding `-list`
+# will still be processed
 #
 # environment variables (used by logrotate):
 #
@@ -84,7 +87,7 @@ function runpid() {
 	if test -n "$pid"; then
 		echo -e "\x1b[1;32mrunning\x1b[1;37m $pid\x1b[0m"
 	else
-		echo -e "\x1b[1;33mnot running\x1b[0m"
+		echo -e "\x1b[1;33mstopped\x1b[0m"
 	fi
 }
 
@@ -134,7 +137,7 @@ function ckrunning() {
 
 	childids "$pid" | sort -k1,1r -k2,2 | cut -f2 -d' ' >"$pidfile"
 
-	kill -TERM "$pid" && return 1 || return 0
+	kill -TERM "$pid" && return 1
 }
 
 function diffnames() {
@@ -555,6 +558,16 @@ function listen() {
 	done
 } >&2
 
+function remove_service() {
+	dir="$1"
+
+	find "${homedir}/data$dir" -maxdepth 1 -name data.db -delete
+
+	find "${homedir}/log$dir" -maxdepth 1 -type f -delete
+
+	find "${homedir}/"{run,log,data} -type d -empty -delete
+}
+
 while test -n "$1"; do
 	arg="$1"
 	shift
@@ -566,12 +579,12 @@ while test -n "$1"; do
 
 	'-list') CAT_FORCED=; set -- -nolisten . ;;&
 
-	'-halt') CAT_NO_LISTEN=1 CAT_FORCED=1 ;;&
+	'-halt'|'-remove') CAT_FORCED=1 ;;&
 
-	'-status') CAT_NO_LISTEN=1 ;;&
+	'-list'|'-status'|'-halt'|'-remove') CAT_NO_LISTEN=1 ;;&
 
 	-*) test -n "$CAT_COMMAND" && {
-		fatal "only one of -rebuild, -status, -sync or -halt is allowed per directory"
+		fatal "only one of -rebuild, -status, -sync, -halt or -remove is allowed per directory"
 		fatal "command is already set to '$CAT_COMMAND'"
 		exit 1
 	}
@@ -610,6 +623,8 @@ while test -n "$1"; do
 	case "$CAT_COMMAND" in
 	'halt') info "halted listener for '$dir'" ;;
 
+	'remove') remove_service "$dir" ;;
+
 	'rebuild') createdb "$dir" "$db" || {
 		fatal "failed to create database" >&3
 		exit 1
@@ -629,7 +644,8 @@ while test -n "$1"; do
 	done ;;
 
 	*) test -n "$CAT_COMMAND" && {
-		fatal "unrecognized command '$CAT_COMMAND'" >&3
+		fatal "unrecognized command '-$CAT_COMMAND'" >&3
+		sed -r '2,/^$/ !d; s/^# ?//' "$0"
 		exit 1
 	} ;;
 	esac

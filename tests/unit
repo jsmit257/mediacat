@@ -1,6 +1,7 @@
 #!/bin/sh
 
 shopt -s lastpipe
+set -o pipefail
 
 cd "`dirname "$0"`"
 
@@ -13,11 +14,11 @@ db="../data$watched/data.db" # FIXME: should come from catalog
 alias debug='echo -e "\x1b[1;36mdebug\x1b[0m"'
 alias start='echo -e "\n\x1b[1;33mstarting\x1b[0m ${FUNCNAME[0]}"'
 alias pass='echo -e "\x1b[1;35mpassed\x1b[0m ${FUNCNAME[0]}"'
-alias fail='echo -e "\x1b[1;31mfailed\x1b[0m"'
+alias fail='echo -e "\x1b[1;31mfailed\x1b[0m pgid($$)"'
 
 alias nodaemon='../bin/catalog -nolisten'
-alias query='sqlite3 -bail -readonly -json "../$db"'
-alias findmedia='../findmedia "$watched"'
+alias query='sqlite3 -bail -readonly -json "$db"'
+alias findmedia='../bin/findmedia "$watched"'
 
 jqcompare='if ($expected | sort) != . then error("unexpected results") else "pass" end'
 jqnotcontains='if contains($exclude) then error("path(s) not removed") else "pass" end'
@@ -79,7 +80,7 @@ function inodepaths() {
 }
 
 function findmediafiles() {
-	findmedia "$@" | jq '.[].files' | tee >(cat >&2)
+	findmedia "$@" | yq '.[].files' | tee >(cat >&2)
 }
 
 function rebuild() {
@@ -200,7 +201,7 @@ function non_unique_link() {
 
 	inodepaths | jq --argjson expected "$inodepaths" -r "$jqcompare" || return 1
 
-	findmediafiles	"tagvalue = 'Ben Franklin'" \
+	findmediafiles value='Ben Franklin' \
 	| jq --argjson expected "$mediafiles" -r "$jqcompare" || return 1
 
 	pass
@@ -268,10 +269,116 @@ function fake_moved_from() {
 	pass
 }
 
+function start_listener() {
+	start "- should start listener"
+
+	../bin/catalog "$watched"
+	echo -n "sleeping while listener starts... "
+	sleep .3s
+	echo "done sleeping"
+
+	pgrep -g "$$" || return 1
+
+	pass
+}
+
+function check_status() {
+	start "- should show sample service running"
+
+	../bin/catalog -status "$watched" 2>&1 \
+	| grep 'tests/sample' \
+	| grep -q 'running' || return 1
+
+	pass
+}
+
+function list_status() {
+	start "- should show sample service running"
+
+	../bin/catalog -list 2>&1 \
+	| grep 'tests/sample' \
+	| grep -q 'running' || return 1
+
+	pass
+}
+
+function rebuild_while_running() {
+	start "- should fail to start a sync process"
+
+	../bin/catalog -rebuild "$watched" && return 1
+
+	pass
+}
+
+function sync_while_running() {
+	start "- should fail to start a sync process"
+
+	../bin/catalog -sync "$watched" && return 1
+
+	pass
+}
+
+function listen_while_running() {
+	start "- should fail to start a listener process"
+
+	../bin/catalog "$watched" && return 1
+
+	pass
+}
+
+function force_listen() {
+	start "- should succeed starting a new listener"
+
+	../bin/catalog -force "$watched" || return 1
+
+	pass
+}
+
+function listen_changes() {
+	read -d '' inodepaths<<-EOF
+	[
+	  "$watched/foo/quux/liberty.mp4",
+	  "$watched/one/two/morel.mp4",
+	  "$watched/agaric.mp4"
+	]
+	EOF
+	read -d '' mediafiles<<-EOF
+	[
+	  "$watched/foo/quux/liberty.mp4"
+	]
+	EOF
+
+	start "- expected inodepaths: $inodepaths and mediafiles: $mediafiles"
+
+	mv -v "$watched/one/two/three/liberty.mp4" "$watched/foo/quux"
+	mv -v "$watched/phosphor.mp4" "$watched/.."
+	rm -v "$watched/../phosphor.mp4"
+	ln -v "pool/morel.mp4" "$watched/one/two"
+
+	inodepaths | jq --argjson expected "$inodepaths" -r "$jqcompare" || return 1
+
+	findmediafiles value='Ben Franklin' \
+	| jq --argjson expected "$mediafiles" -r "$jqcompare" || return 1
+
+	pass
+}
+
+function cleanup() {
+	trees=(../{data,log,run}"$watched")
+
+	start "- should remove trees for '${trees[@]}'"
+
+	../bin/catalog -remove "$watched" || return 1
+
+	find "${trees[@]}" 2>/dev/null && return 1
+
+	pass
+}
+
 start "- full test suite..."
 
 if ! sanity; then
-	fail  "setting up the test environment"
+	fail "setting up the test environment"
 elif ! rebuild; then
 	fail "rebuild"
 elif ! link_one_from_pool; then
@@ -286,7 +393,26 @@ elif ! cleanup_orphaned_trees; then
 	fail "cleanup_orphaned_trees"
 elif ! fake_moved_from; then
 	fail "fake_moved_from"
+elif ! start_listener; then
+	fail "starting listener"
+elif ! check_status; then
+	fail "checking status"
+elif ! list_status; then
+	fail "listing status"
+elif ! rebuild_while_running; then
+	fail "rebuilding while running"
+elif ! sync_while_running; then
+	fail "syncing while running"
+elif ! listen_while_running; then
+	fail "listening while running"
+elif ! force_listen; then
+	fail "forcing a new listener"
+#elif ! listen_changes; then
+#	fail "listening for changes"
+elif ! cleanup; then
+	fail "removing a service"
 else
+	rm -rf "$watched"
 	echo
 	pass "... full test suite"
 fi

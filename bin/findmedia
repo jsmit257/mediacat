@@ -49,6 +49,7 @@
 }
 
 shopt -s lastpipe
+set -o pipefail
 
 function condition() {
 	case "${1:0:1}" in
