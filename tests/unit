@@ -16,9 +16,10 @@ alias start='echo -e "\n\x1b[1;33mstarting\x1b[0m ${FUNCNAME[0]}"'
 alias pass='echo -e "\x1b[1;35mpassed\x1b[0m ${FUNCNAME[0]}"'
 alias fail='echo -e "\x1b[1;31mfailed\x1b[0m pgid($$)"'
 
+alias ffmpeg=' ffmpeg -nostdin -hide_banner -nostats -v error'
 alias nodaemon='../bin/catalog -nolisten'
-alias query='sqlite3 -bail -readonly -json "$db"'
 alias findmedia='../bin/findmedia "$watched"'
+alias query='sqlite3 -bail -readonly -json "$db"'
 
 jqcompare='if ($expected | sort) != . then error("unexpected results") else "pass" end'
 jqnotcontains='if contains($exclude) then error("path(s) not removed") else "pass" end'
@@ -35,16 +36,14 @@ function vidgen() {
 	done
 
 	ffmpeg \
-		-nostdin \
-		-hide_banner \
-		-nostats \
-		-v error \
-		-i px.gif \
-		-loop 1 \
+		-f lavfi \
+		-i testsrc=duration=1:size=960x540:rate=24 \
+		-f lavfi \
+		-i anullsrc=sample_rate=44000:channel_layout=5.1 \
 		-c:v hevc \
 		-x265-params log-level=error \
-		-pix_fmt yuv420p \
-		-s 50:50 \
+		-c:a aac \
+		-shortest \
 		"${args[@]}" \
 		"pool/$dst"
 }
@@ -60,6 +59,23 @@ function sanity() {
 	vidgen morel description "Good Luck Finding Them" comment "Gourmet" &&
 	vidgen muertos comment "Like it's 1999" date "1999.12.31" &&
 	vidgen phosphor date "1970.01.01" title "Unix Epoch" &&
+
+	ffmpeg \
+		-f lavfi \
+		-i testsrc=duration=1:size=960x540:rate=30 \
+		-c:v hevc \
+		-x265-params log-level=error \
+		-metadata title="video only" \
+		"pool/videoonly.mp4"
+
+	ffmpeg \
+		-f lavfi \
+		-i anullsrc=sample_rate=44000:channel_layout=stereo \
+		-c:a mp3 \
+		-t 1 \
+		-metadata title="audio only" \
+		"pool/audioonly.mp3"
+
 	ln -v pool/{agaric,morel,phosphor}.mp4 "$watched" || return 1
 
 	pass "- setting up the test environment"
@@ -80,7 +96,7 @@ function inodepaths() {
 }
 
 function findmediafiles() {
-	findmedia "$@" | yq '.[].files' | tee >(cat >&2)
+	findmedia "$@" | tee >(cat >&2) | yq '.[].files'
 }
 
 function rebuild() {
@@ -207,7 +223,7 @@ function non_unique_link() {
 	pass
 }
 
-function cleanup_orphaned_trees() {
+function clean_orphaned_trees() {
 	read -d '' excludepaths<<-EOF
 	[
 	  "foo",
@@ -220,10 +236,7 @@ function cleanup_orphaned_trees() {
 
 	rm -v "$watched/foo/quux/liberty.mp4"
 
-	nodaemon -sync "$watched" || {
-		fail "executing move_file_in_tree"
-		return 1
-	}
+	nodaemon -sync "$watched" || return 1
 
 	allpathnames | jq --argjson exclude "$excludepaths" -r "$jqnotcontains" || return 1
 
@@ -259,14 +272,49 @@ function fake_moved_from() {
 		return 1
 	}
 
-	nodaemon -sync "$watched" || {
-		fail "fake_moved_from"
-		return 1
-	}
+	nodaemon -sync "$watched" || return 1
 
 	allpathnames | jq --argjson exclude "$excludepaths" -r "$jqnotcontains" || return 1
 
 	pass
+}
+
+function video_only() {
+	read -d '' mediafiles<<-EOF
+	[
+	  "$watched/videoonly.mp4"
+	]
+	EOF
+
+	start "- expected mediafiles: $mediafiles"
+
+	ln -v "pool/videoonly.mp4" "$watched"
+
+	nodaemon -sync "$watched" || return 1
+
+	findmediafiles value%'%only' \
+	| jq --argjson expected "$mediafiles" -r "$jqcompare" || return 1
+
+	rm -v "$watched/videoonly.mp4" && pass
+}
+
+function audio_only() {
+	read -d '' mediafiles<<-EOF
+	[
+	  "$watched/audioonly.mp3"
+	]
+	EOF
+
+	start "- expected mediafiles: $mediafiles"
+
+	ln -v "pool/audioonly.mp3" "$watched"
+
+	nodaemon -sync "$watched" || return 1
+
+	findmediafiles value%'%only' \
+	| jq --argjson expected "$mediafiles" -r "$jqcompare" || return 1
+
+	rm -v "$watched/audioonly.mp3" && pass
 }
 
 function start_listener() {
@@ -303,7 +351,7 @@ function list_status() {
 }
 
 function rebuild_while_running() {
-	start "- should fail to start a sync process"
+	start "- should fail to start a rebuild process"
 
 	../bin/catalog -rebuild "$watched" && return 1
 
@@ -369,6 +417,7 @@ function cleanup() {
 	start "- should remove trees for '${trees[@]}'"
 
 	../bin/catalog -remove "$watched" || return 1
+	#../bin/catalog -halt "$watched" || return 1
 
 	find "${trees[@]}" 2>/dev/null && return 1
 
@@ -389,10 +438,14 @@ elif ! move_file_in_tree; then
 	fail "move_file_in_tree"
 elif ! non_unique_link; then
 	fail "non_unique_link"
-elif ! cleanup_orphaned_trees; then
-	fail "cleanup_orphaned_trees"
+elif ! clean_orphaned_trees; then
+	fail "cleaning orphaned trees"
 elif ! fake_moved_from; then
 	fail "fake_moved_from"
+elif ! video_only; then
+	fail "video only file"
+elif ! audio_only; then
+	fail "audio only file"
 elif ! start_listener; then
 	fail "starting listener"
 elif ! check_status; then
@@ -412,7 +465,7 @@ elif ! force_listen; then
 elif ! cleanup; then
 	fail "removing a service"
 else
-	rm -rf "$watched"
+	rm -rf "$watched" ./pool
 	echo
 	pass "... full test suite"
 fi

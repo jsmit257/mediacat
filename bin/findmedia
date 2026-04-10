@@ -21,19 +21,22 @@
 # /watched/directory is the name of a directory that was previously indexed by
 # the catalog script (see below); an error is returned if no database exists
 #
-# criteria is either 'name' or 'value', followed by either '=' (for exact match),
-# or '%' (for a sql `like` pattern match), followed by the value to match; e.g.
+# criteria are either 'name' or 'value', followed by either '=' (for exact match),
+# or '%'/'%%' (for a sql `like` pattern match), followed by the pattern to match; e.g.
 # - name=date: matches all tags named date
-# - value="Tag Value" matches all tags with the exact value 'Tag Value' (i.e.
-#   `where tagvalue = 'Tag Value')
+# - value="Tag Value" matches all tags with the exact value 'Tag Value'
 # - value%"%pattern_" matches all tags that contain zero or more chars ('%'),
 #   followed  by 'pattern' (case-insensitive) followed by exactly one char ('_')
-#   (i.e. `where tagvalue like '%pattern_'`)
+#   (i.e. `where tagvalue like '%pattern_'`); if the operator is '%%' then the
+#   pattern portion is wrapped in '%' chars, so value%%pattern resolves to
+#   `tagvalue like '%pattern%'`
 #
-# use 'and' or 'or' between criteria to further refine the search conditions; 'and'
-# is optional and implied when criteria appear consecutively (e.g. name=date
-# value%"2012%" translates to `where tagname = 'date' and tagvalue like '2012%'`);
-# the 'or' conjunction must be specified explicitly
+# use 'and', 'or' and 'not' between criteria to further refine the search conditions
+# - 'and' is optional and implied when criteria appear consecutively; e.g.
+#   `name=date value%"2012%"` translates to:
+#   `where tagname = 'date' and tagvalue like '2012%'`
+# - the 'or' conjunction must be specified explicitly
+# - 'not' modifies the preceeding 'or' or (implicit) 'and'
 #
 # it is not recommended to use 'name=tagname' without a corresponding 'value...'
 # criterion as this will likely return a prohibitively long result, but this is
@@ -51,10 +54,15 @@
 shopt -s lastpipe
 set -o pipefail
 
-function condition() {
-	case "${1:0:1}" in
-	'%') echo "like" ;;
-	'=') echo "=" ;;
+function operate() {
+	op="${1:0:1}"
+	val="${1:1}"
+
+	case "$op" in
+	'=') echo "= '$val'" ;;
+	'%')
+		test "${val:0:1}" == '%' && val="${val}%"
+		echo "like '$val'" ;;
 	*)
 		echo "unknown conditional operator '${1[0]}'" >&2
 		exit 1 ;;
@@ -65,40 +73,18 @@ function parsearg() {
 	local arg="${1//\'/\'\'}"
 
 	case "$arg" in
-	name*) echo "tagname `condition "${arg#name}"` '${arg:5}'" ;;
-	value*) echo "tagvalue `condition "${arg#value}"` '${arg:6}'" ;;
+	name*) echo "tagname `operate "${arg#name}"`" ;;
+	value*) echo "tagvalue `operate "${arg#value}"`" ;;
 	*)
 		echo "arguments must start with 'name' or 'value', not '$arg'" >&2
 		exit 1 ;;
 	esac
 }
 
-read -d '' fmt<<-'EOF'
-group_by(.inode)
-| map(
-	foreach .[] as $file (
-		{};
-		. *= {
-			key: $file.inode | tostring,
-			value: {
-				files: (.value.files) + [$file.fullname],
-				tags: { ($file.tagname): $file.tagvalue }
-			}
-		};
-		{
-			key: .key,
-			value: {
-				files: .value.files | unique,
-				tags: .value.tags
-			}
-		}
-	)
-)
-| from_entries
-EOF
-
 readlink -f "$1" | read dir
 readlink -f "`dirname "$0"`/.." | read homedir
+
+read -d '' fmtjq <"$homedir/etc/fmt.jq"
 
 db="${homedir}/data/$dir/data.db"
 test -f "$db" || {
@@ -113,19 +99,29 @@ test "${#@}" -eq 0 && {
 	exit 1
 } >&2
 
-parsearg "$1" | read where
-shift
 while test -n "$1"; do
-	case "$1" in
-	'or') where+=" or "; shift ;;
-	'and') shift ;;&
-	*) where+=" and " ;;
+	arg="$1"
+	shift
+
+	case "$arg" in
+	'or'|'and') conjunction=" $arg" ;;&
+	'not') conjunction="$conjunction $arg" ;;&
+	'or'|'and'|'not') continue ;;
 	esac
 
-	where+="`parsearg "$1"`"
+	where+="$conjunction `parsearg "$arg"`"
 
-	shift
+	conjunction=" and"
 done
+
+test -n "$nodetail" && {
+	noaudio=1
+	novideo=1
+}
+
+test -n "$noaudio" && filter=".[].audio"
+test -n "$novideo" && filter+="${filter:+,}.[].video"
+test -n "$filter"  && filter="del($filter)"
 
 cat<<-EOF|
 with taginodes(inode) as (
@@ -139,5 +135,5 @@ select  *
   join  taginodes ti
     on  ft.inode  = ti.inode
 EOF
-sqlite3 -readonly -bail -json "$db" | yq -y "$fmt"
+sqlite3 -readonly -bail -json "$db" | jq "$fmtjq" | yq -y "${filter:-.}"
 

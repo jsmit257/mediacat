@@ -65,21 +65,13 @@ alias sqlinfo='echo -e ".print \x1b[1;32minfo\x1b[0m"'
 alias sqlwarn='echo -e ".print \x1b[1;33mwarn\x1b[0m"'
 alias sqlerr='echo -e ".print \x1b[1;31merror\x1b[0m"'
 alias sqlfatal='echo -e ".print \x1b[1;37;41mfatal\x1b[0m"'
-alias probetags='ffprobe -v quiet -output_format json -show_entries format_tags'
+alias probetags='ffprobe -v quiet -output_format json -show_streams -show_entries format_tags'
 
 readlink -f "`dirname "$0"`/.." | read homedir
 
-read -d '' tagjq<<-'EOF'
-.format.tags // {}
-| del(
-	.major_brand,
-	.minor_version,
-	.compatible_brands,
-	.encoder
-)
-EOF
+read -d '' metajq <"$homedir/etc/meta.jq"
 
-. "`dirname "$0"`/logrotate"
+. "$homedir/bin/logrotate"
 
 function runpid() {
 	find "${homedir}/run$1" -maxdepth 1 -type f -printf "%f" 2>/dev/null | read pid
@@ -171,9 +163,8 @@ function createnames() {
 function inserttags() {
 	local inode="$1"
 	local name value
-	shift
 
-	jq -r 'to_entries[] | "\(.key) \(.value)"' <<<"$@" \
+	jq -r 'to_entries[] | "\(.key) \(.value)"' \
 	| while read name value; do
 		cat - <<-EOF
 		insert  into tagvalues(tagvalue, inode, tagnameid)
@@ -185,6 +176,32 @@ function inserttags() {
 		;
 		EOF
 	done
+}
+
+function insertvideo() {
+	local video
+
+	if ! jq -r '.video' | read video; then
+		return 1
+	elif test -n "$video"; then
+		cat <<-EOF
+		insert into videos(inode, codec, bitrate, framerate, width, height, aspect)
+		values($inode, $video);
+		EOF
+	fi
+}
+
+function insertaudio() {
+	local audio
+
+	if ! jq -r '.audio' | read audio; then
+		return 1
+	elif test -n "$audio"; then
+		cat <<-EOF
+		insert into audios(inode, codec, bitrate, samplerate, channels, layout)
+		values($inode, $audio);
+		EOF
+	fi
 }
 
 function createpaths() {
@@ -233,14 +250,22 @@ function closewrite() {
 
 	if test "$inode" -ne "${lastinode:-0}"; then
 		# poor-man's test for a media file; don't create inode if this fails
-		if ! probetags "$file" | jq -c "$tagjq" | read tags; then
+		if ! probetags "$file" | jq -c "$metajq" | read metas; then
 			sqlwarn "failed to read tags from '$file'"
+			return 1
+		elif ! echo "$metas" | jq -r '.duration' | read micros; then
+			sqlwarn "no duration from '$file'"
 			return 1
 		fi
 
-		echo "insert into inodes(inode) values($inode);"
+		echo "insert into inodes(inode, micros) values($inode, $micros);"
 
-		if test "$tags" == '{}'; then
+		echo "$metas" | insertvideo "$inode" || fatal "failed parsing video from '$metas' for '$file'" >&3
+		echo "$metas" | insertaudio "$inode" || fatal "failed parsing audio from '$metas' for '$file'" >&3
+
+		if ! echo "$metas" | jq -c '.tags' | read tags; then
+			fatal "couldn't get tags from '$metas' for '$file'" >&3
+		elif test "$tags" == '{}'; then
 			sqlwarn  "no tags found in file '$file'"
 		elif ! echo "$tags" | jq -r 'keys[]' | readarray -t tempnames; then
 			fatal "failed to extract tag names from '$tags' for '$file'" >&3
@@ -248,7 +273,7 @@ function closewrite() {
 			sqlwarn "couldn't difference tag names" # this won't happen
 		elif ! createnames "${newnames[@]}"; then
 			sqlerr "couldn't create statements for new tagnames '${newnames[@]}'"
-		elif ! inserttags "$inode" "$tags"; then
+		elif ! echo "$tags" | inserttags "$inode"; then
 			fatal "couldn't create statements for new tagvalues" >&3
 		else
 			sqlinfo "added ${#tempnames[@]} tags for '$inode'"
@@ -305,12 +330,11 @@ function remove() {
 	EOF
 
 	test "${linkcount:-0}" -lt 2 && cat - <<-EOF
-	delete  from tagvalues
-	 where  inode = '$inode'
-	;
-	delete  from inodes
-	 where  inode = '$inode'
-	;
+	delete from tagvalues where inode = '$inode';
+	delete from videos where inode = '$inode';
+	delete from audios where inode = '$inode';
+	delete from inodes where inode = '$inode';
+
 	`sqlinfo "removed inode $inode and values for '$file'"`
 	EOF
 }
@@ -498,7 +522,7 @@ function listen() {
 	trap 'cleanup "$dir"' TERM INT PIPE
 
 	exec 1>>"$logdir/listen.log" 2>&1
-	exec 3> >(tee -a "$logdir/fatal.log")
+	exec 3> >(tee -a "$logdir/fatal.log") >&2
 
 	roller "$logdir" &
 
@@ -561,11 +585,11 @@ function listen() {
 function remove_service() {
 	dir="$1"
 
-	find "${homedir}/data$dir" -maxdepth 1 -name data.db -delete
+	find "${homedir}/data$dir" -maxdepth 1 -name data.db -delete -printf "removed database: %p\n"
 
-	find "${homedir}/log$dir" -maxdepth 1 -type f -delete
+	find "${homedir}/log$dir" -maxdepth 1 -type f -delete -printf "removed log: %p\n"
 
-	find "${homedir}/"{run,log,data} -type d -empty -delete
+	find "${homedir}/"{run,log,data} -type d -empty -delete -printf "removed empty dir: %p\n"
 }
 
 while test -n "$1"; do
@@ -584,36 +608,37 @@ while test -n "$1"; do
 	'-list'|'-status'|'-halt'|'-remove') CAT_NO_LISTEN=1 ;;&
 
 	-*) test -n "$CAT_COMMAND" && {
-		fatal "only one of -rebuild, -status, -sync, -halt or -remove is allowed per directory"
-		fatal "command is already set to '$CAT_COMMAND'"
+		fatal "only one of -rebuild, -sync, -halt, -status, -list or -remove is allowed per directory"
+		fatal "command is already set to '$CAT_COMMAND', '$arg' not allowed"
 		exit 1
 	}
 	CAT_COMMAND="${arg#-}"
 	continue ;;
 	esac
 
-	readlink -f "$arg" | read dir
+	if test "$CAT_COMMAND" != 'list'; then
+		readlink -f "$arg" | read dir
+		test -d "$dir" || {
+			fatal "'$dir' from '$arg'  does not specify a directory"
+			exit 1
+		}
 
-	test -d "$dir" || {
-		fatal "'$dir' from '$arg'  does not specify a directory"
-		exit 1
-	}
+		logdir="${homedir}/log$dir"
+		test -d "$logdir" || mkdir -vp "$logdir" || {
+			fatal "'$logdir' is not a directory and couldn't be created"
+			exit 1
+		}
+		exec 3> >(tee "$logdir/fatal.log") >&2
 
-	logdir="${homedir}/log$dir"
-	test -d "$logdir" || mkdir -vp "$logdir" || {
-		fatal "'$logdir' is not a directory and couldn't be created"
-		exit 1
-	}
-	exec 3> >(tee "$logdir/fatal.log")
+		dbdir="${homedir}/data$dir"
+		test -d "$dbdir" || mkdir -vp "$dbdir" || {
+			fatal "'$dbdir' is not a directory and couldn't be created" >&3
+			exit 1
+		}
+		db="$dbdir/data.db"
 
-	dbdir="${homedir}/data$dir"
-	test -d "$dbdir" || mkdir -vp "$dbdir" || {
-		fatal "'$dbdir' is not a directory and couldn't be created" >&3
-		exit 1
-	}
-	db="$dbdir/data.db"
-
-	test ! -f "$db" -a "${CAT_COMMAND:-sync}" == 'sync' && CAT_COMMAND=rebuild
+		test ! -f "$db" -a "${CAT_COMMAND:-sync}" == 'sync' && CAT_COMMAND=rebuild
+	fi
 
 	if test "$CAT_COMMAND" != 'status' && ckrunning "$dir"; then
 		fatal "failed to execute '${CAT_COMMAND:-listener}'; an instance is still running for '$dir'" >&3
@@ -625,22 +650,22 @@ while test -n "$1"; do
 
 	'remove') remove_service "$dir" ;;
 
-	'rebuild') createdb "$dir" "$db" || {
+	'rebuild') createdb "$dir" "$db" 2>&1 | tee "$logdir/build.log" || {
 		fatal "failed to create database" >&3
 		exit 1
-	} 2>&1 | tee "$logdir/build.log" ;;
+	} ;;
 
-	'sync') syncdb "$dir" "$db" || {
+	'sync') syncdb "$dir" "$db" 2>&1 | tee "$logdir/sync.log" || {
 		fatal "failed to sync database" >&3
 		exit 1
-	} 2>&1 | tee "$logdir/sync.log" ;;
+	} ;;
 
 	'status') echo "'$dir' (`runpid "$dir"`)" ;;
 
 	'list') find "${homedir}/data" -name 'data.db' -printf "/%P\n" \
 	| while read svc; do
 		dirname "$svc" | read svc
-		echo -e "- $svc status (`runpid "$svc"`)"
+		echo "- $svc status (`runpid "$svc"`)"
 	done ;;
 
 	*) test -n "$CAT_COMMAND" && {
