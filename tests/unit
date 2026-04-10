@@ -40,11 +40,15 @@ function vidgen() {
 		-nostats \
 		-v error \
 		-i px.gif \
-		-loop 1 \
+		-f lavfi \
+		-i anullsrc=sample_rate=44000:channel_layout=5.1 \
 		-c:v hevc \
 		-x265-params log-level=error \
 		-pix_fmt yuv420p \
 		-s 50:50 \
+		-c:a aac \
+		-shortest \
+		-loop 1 \
 		"${args[@]}" \
 		"pool/$dst"
 }
@@ -368,7 +372,8 @@ function cleanup() {
 
 	start "- should remove trees for '${trees[@]}'"
 
-	../bin/catalog -remove "$watched" || return 1
+	#../bin/catalog -remove "$watched" || return 1
+	../bin/catalog -halt "$watched" || return 1
 
 	find "${trees[@]}" 2>/dev/null && return 1
 
@@ -412,7 +417,7 @@ elif ! force_listen; then
 elif ! cleanup; then
 	fail "removing a service"
 else
-	rm -rf "$watched"
+	rm -rf "$watched" ./pool
 	echo
 	pass "... full test suite"
 fi

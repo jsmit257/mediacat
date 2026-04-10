@@ -3,7 +3,8 @@
 PRAGMA foreign_keys = ON;
 
 create table inodes (
-	inode integer not null primary key
+	inode  integer not null primary key,
+	micros integer not null
 );
 
 create table paths (
@@ -19,6 +20,25 @@ create table files (
 	inode integer not null references inodes(inode)
 );
 create index fk_files_inode on files(inode);
+
+create table videos (
+	inode     integer not null primary key references inodes(inode),
+	codec     varchar not null,
+	bitrate   numeric not null,
+	framerate varchar not null,  -- avg_frame_rate
+	width     integer not null,
+	height    integer not null,
+	aspect    varchar not null  -- display_aspect_ratio
+);
+
+create table audios (
+	inode      integer not null primary key references inodes(inode),
+	codec      varchar not null,
+	bitrate    varchar not null,
+	samplerate integer not null,
+	channels   integer not null,
+	layout     varchar not null
+);
 
 create table tagnames (
 	id      integer not null primary key,
@@ -152,13 +172,34 @@ select  inode
 
 create view filetags
 as
-select  t.inode
+select  i.inode
+       ,i.micros
        ,t.tagname
        ,t.tagvalue
        ,ip.inodepath as fullname
-  from  tags       t
+       ,v.codec      as video_codec
+       ,v.bitrate    as video_bitrate
+       ,v.framerate
+       ,v.width
+       ,v.height
+       ,v.aspect
+       ,a.codec      as audio_codec
+       ,a.bitrate    as audio_bitrate
+       ,a.samplerate as samplerate
+       ,a.channels
+       ,a.layout
+  from  inodes     i
   join  inodepaths ip
-    on  t.inode    = ip.inode
+    on  i.inode    = ip.inode
+  left
+  join  tags       t
+    on  i.inode    = t.inode
+  left
+  join  videos     v
+    on  i.inode    = v.inode
+  left
+  join  audios     a
+    on  i.inode    = a.inode
 ;
 
 create view orphans
