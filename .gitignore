@@ -4,5 +4,7 @@
 ! ./bin/findmedia
 ! ./bin/logrotate
 ! ./etc/createdb.sql
+! ./etc/fmt.jq
+! ./etc/meta.jq
 ! ./tests/unit
 
