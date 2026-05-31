@@ -1,0 +1,18 @@
+#!/bin/sh
+
+shopt -s lastpipe
+
+readlink -f "${1:-.}" | read datadir
+
+cat <<-EOF|
+select  tv.tagvalue
+  from  tagvalues      tv
+  join  tagnames       tn
+    on  tv.tagnameid = tn.id
+ where  tn.tagname   = 'artist'
+EOF
+sqlite3 "`dirname "$0"`/../data$datadir/data.db" \
+| sed 's/,/\n/g; s/([^)]*)*//g; s/^ *//; s/ *$//' \
+| sort \
+| uniq
+

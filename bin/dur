@@ -1,0 +1,58 @@
+#!/bin/sh
+
+shopt -s lastpipe
+
+function fmt() {
+	cat <<-EOF|
+		with  agg(files, seconds, minute, hour, day, week) as (
+	select  count(1)                           as files
+	       ,cast(sum(micros) / 1000000 as int) as seconds
+				 ,60                                 as minute
+				 ,60 * 60                            as hour
+				 ,60 * 60 * 24                       as day
+				 ,60 * 60 * 24 * 7                   as week
+		from  inodes
+	)
+	select  files                    as files
+	       ,seconds / minute / files as avg_min
+	       ,seconds / week           as weeks
+				 ,seconds % week / day     as days
+				 ,seconds % day / hour     as hours
+				 ,seconds % hour / minute  as minutes
+				 ,seconds % minute         as seconds
+		from  agg
+	EOF
+	sqlite3 -json "`dirname "$0"`/../data`readlink -f "$1"`/data.db" \
+	| jq '.[] | to_entries | map(select(.value > 0)) | from_entries'
+}
+
+test "${#@}" -eq 0 && set -- .
+
+while test -n "$1"; do
+	if test "${1:0:1}" == '-'; then
+		fmts+=("${1##*-}")
+	else
+		repo="$1"
+	fi
+	shift
+
+	test -z "$repo" -a "${#@}" -ne 0 && continue
+
+	test "${#fmts[@]}" -eq 0 && fmts=(text)
+
+	readlink -f "${repo:-.}" | read repo
+
+	fmt "$repo" | read -d '' duration
+
+	for fmt in "${fmts[@]}"; do
+		case "$fmt" in
+		'json') jq --arg repo "$repo" '{ $repo: . }' ;;
+		'yaml') yq --arg repo "$repo" -y '{ $repo: . }' ;;
+		'text') jq -r '"'"$repo: "'" + (to_entries | map("\(.value) \(.key)") | join(", "))' ;;
+		*) echo "unknown format: '$fmt' duration: '$duration'" >&2
+		esac <<<"$duration"
+	done
+
+	unset repo fmt fmts duration
+done
+

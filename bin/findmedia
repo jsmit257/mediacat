@@ -9,12 +9,20 @@
 #   tags:
 #     tag: value
 #     ...
+#   audio:
+#     codec: name
+#     bitrate: number
+#     ...
+#   video:
+#     codec: name
+#     bitrate: number
+#     ...
 # ...
 #
 # results are objects indexed by inode number, containing a list of files linked
 # to the inode, and a list of metadata tags extracted from then inode
 #
-# usage: findmedia [-help] /watched/directory criterion [and|or] ...
+# usage: [brief=1] [noaudio=1] [novideo=1] findmedia [-help] /watched/directory criterion [and|or] [not] ...
 #
 # -help: print this help and exit, no other processing is performed
 #
@@ -38,6 +46,9 @@
 # - the 'or' conjunction must be specified explicitly
 # - 'not' modifies the preceeding 'or' or (implicit) 'and'
 #
+# environment variables, if not empty, remove the corresponding details from the
+# output; `brief=1` is equivalent to `noaudio=1 novideo=1`
+
 # it is not recommended to use 'name=tagname' without a corresponding 'value...'
 # criterion as this will likely return a prohibitively long result, but this is
 # not enforced; there is no way to query for `is null` because neither names nor
@@ -109,12 +120,12 @@ while test -n "$1"; do
 	'or'|'and'|'not') continue ;;
 	esac
 
-	where+="$conjunction `parsearg "$arg"`"
+	where+="$conjunction `parsearg "$arg"`" || exit 1
 
 	conjunction=" and"
 done
 
-test -n "$nodetail" && {
+test -n "$brief" && {
 	noaudio=1
 	novideo=1
 }

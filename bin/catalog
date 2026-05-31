@@ -69,7 +69,7 @@ alias probetags='ffprobe -v quiet -output_format json -show_streams -show_entrie
 
 readlink -f "`dirname "$0"`/.." | read homedir
 
-read -d '' metajq <"$homedir/etc/meta.jq"
+read -rd '' metajq <"$homedir/etc/meta.jq"
 
 . "$homedir/bin/logrotate"
 
@@ -254,7 +254,7 @@ function closewrite() {
 			sqlwarn "failed to read tags from '$file'"
 			return 1
 		elif ! echo "$metas" | jq -r '.duration' | read micros; then
-			sqlwarn "no duration from '$file'"
+			sqlwarn "no duration from '$metas' for '$file'"
 			return 1
 		fi
 
