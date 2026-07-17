@@ -1,12 +1,6 @@
 *
-! .gitignore
-! ./bin/artists
-! ./bin/catalog
-! ./bin/dur
-! ./bin/findmedia
-! ./bin/logrotate
-! ./etc/createdb.sql
-! ./etc/fmt.jq
-! ./etc/meta.jq
-! ./tests/unit
+!.gitignore
+!bin/
+!etc/
+!tests/unit
 
